@@ -7,6 +7,15 @@ from fedavgm.dataset import cifar10, fmnist
 from fedavgm.models import cnn, model_to_parameters
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
 from fedavgm.strategy import CustomFedAvgM
+import os
+
+def configure_grpc_keepalive():
+    os.environ["GRPC_KEEPALIVE_TIME_MS"] = "20000"  # 20s：空闲多久发一次 ping
+    os.environ["GRPC_KEEPALIVE_TIMEOUT_MS"] = "5000"  # 5s：ping 超时阈值
+    os.environ["GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS"] = "1"  # 无活动流也允许 keepalive
+    # HTTP/2 层最小 ping 间隔（收/发）
+    os.environ["GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
+    os.environ["GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
 
 
 def _load_dataset(name: str):
@@ -20,6 +29,8 @@ def _load_dataset(name: str):
 
 
 def main() -> None:
+    # Configure gRPC keepalive before creating any channels
+    configure_grpc_keepalive()
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
     parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist")
     parser.add_argument("--strategy", default="custom-fedavgm", choices=["fedavg", "fedavgm", "custom-fedavgm"], help="Aggregation strategy")

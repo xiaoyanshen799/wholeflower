@@ -6,7 +6,15 @@ import flwr as fl
 import logging
 
 from fedavgm.client import FlowerClient
+import os
 
+def configure_grpc_keepalive():
+    os.environ["GRPC_KEEPALIVE_TIME_MS"] = "20000"  # 20s：空闲多久发一次 ping
+    os.environ["GRPC_KEEPALIVE_TIMEOUT_MS"] = "5000"  # 5s：ping 超时阈值
+    os.environ["GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS"] = "1"  # 无活动流也允许 keepalive
+    # HTTP/2 层最小 ping 间隔（收/发）
+    os.environ["GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
+    os.environ["GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
 
 def _load_partition(data_dir: pathlib.Path, cid: int) -> tuple[np.ndarray, np.ndarray]:
     """Load x_train, y_train arrays for the given client id."""
@@ -30,6 +38,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for local training")
 
     args = parser.parse_args()
+
+    # Configure gRPC keepalive early
+    configure_grpc_keepalive()
 
     # ------------------------------------------------------------------
     # Configure logging to a file per client

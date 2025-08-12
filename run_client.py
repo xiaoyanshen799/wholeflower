@@ -6,13 +6,17 @@ import flwr as fl
 import logging
 
 from fedavgm.client import FlowerClient
-import os
-# gRPC keepalive (must run before channel creation)
-os.environ["GRPC_KEEPALIVE_TIME_MS"] = "20000"
-os.environ["GRPC_KEEPALIVE_TIMEOUT_MS"] = "5000"
-os.environ["GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS"] = "1"
-os.environ["GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
-os.environ["GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS"] = "20000"
+import grpc
+
+keepalive_opts = [
+    ('grpc.keepalive_time_ms', 20000),
+    ('grpc.keepalive_timeout_ms', 5000),
+    ('grpc.keepalive_permit_without_calls', 1),
+    ('grpc.http2.min_time_between_pings_ms', 20000),
+    ('grpc.http2.min_ping_interval_without_data_ms', 20000),
+]
+
+
 
 def _load_partition(data_dir: pathlib.Path, cid: int) -> tuple[np.ndarray, np.ndarray]:
     """Load x_train, y_train arrays for the given client id."""
@@ -79,9 +83,9 @@ def main() -> None:
     }
 
     client = FlowerClient(x_train, y_train, x_val, y_val, model_cfg, num_classes)
-
+    channel = grpc.insecure_channel(args.server, options=keepalive_opts)
     print(f">>> Client {args.cid} connecting to {args.server}…")
-    fl.client.start_numpy_client(server_address=args.server, client=client)
+    fl.client.start_numpy_client(client=client, grpc_channel=channel)
 
 
 if __name__ == "__main__":

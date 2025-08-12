@@ -13,9 +13,19 @@ from concurrent import futures
 SRV_OPTS = [
     ("grpc.keepalive_time_ms", 20_000),
     ("grpc.keepalive_timeout_ms", 5_000),
-    ("grpc.http2.min_ping_interval_without_data_ms", 20_000),  # 服务器要求的最小“无数据 PING”间隔
+    ("grpc.http2.min_ping_interval_without_data_ms", 20_000),
     ("grpc.http2.max_pings_without_data", 0),
 ]
+
+_real_srv = grpc.server
+def _srv(executor=None, options=None, *a, **k):
+    if executor is None:
+        executor = futures.ThreadPoolExecutor(max_workers=64)
+    opts = list(options) if options else []
+    return _real_srv(executor, options=opts + SRV_OPTS, *a, **k)
+
+grpc.server = _srv
+
 
 def _load_dataset(name: str):
     """Return (x_train, y_train, x_test, y_test, input_shape, num_classes)."""
@@ -105,18 +115,16 @@ def main() -> None:
             server_momentum=args.server_momentum,
             csv_log_path=args.csv_path,
         )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=SRV_OPTS)
+
     # ------------------------------------------------------------------
     # Start Flower server
     # ------------------------------------------------------------------
     print(f">>> Starting Flower server on {args.address} with strategy {strategy}…")
     fl.server.start_server(
-        grpc_server=server,
         server_address=args.address,
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
     )
-
 
 if __name__ == "__main__":
     main() 

@@ -1,0 +1,143 @@
+"""Dataset utilities for federated learning."""
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+from tensorflow import keras
+
+from fedavgm.common import create_lda_partitions
+
+
+def _ensure_path(pathlike) -> Path:
+    path = Path(pathlike)
+    if not path.exists():
+        raise FileNotFoundError(f"Directory or file not found: {path}")
+    return path
+
+
+def _build_lookup_from_values(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Create a sorted vocabulary array and lookup table mapping original ids to compact ids."""
+    vocab = np.array(sorted(int(v) for v in np.unique(values)), dtype=np.int32)
+    if vocab.size == 0 or vocab[0] != 0:
+        vocab = np.insert(vocab, 0, 0)
+    lookup = np.full(int(vocab[-1]) + 1, -1, dtype=np.int32)
+    lookup[vocab] = np.arange(vocab.size, dtype=np.int32)
+    return vocab, lookup
+
+
+def _remap_array(arr: np.ndarray, lookup: np.ndarray) -> np.ndarray:
+    flat = arr.reshape(-1)
+    max_val = int(flat.max()) if flat.size else 0
+    if max_val >= lookup.size:
+        raise ValueError(f"Encountered value {max_val} outside of lookup range {lookup.size}")
+    remapped = lookup[flat]
+    if np.any(remapped < 0):
+        missing = np.unique(flat[remapped < 0])
+        raise ValueError(f"Found unmapped values: {missing}")
+    return remapped.reshape(arr.shape).astype(np.int32, copy=False)
+
+
+@lru_cache(maxsize=None)
+def load_shakespeare_lookup(data_dir: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load all Shakespeare partitions to construct a shared vocab and lookup table."""
+    directory = _ensure_path(data_dir)
+    all_values = []
+    for npz_path in sorted(directory.glob("client_*.npz")):
+        with np.load(npz_path) as npz:
+            all_values.append(npz["x_train"].ravel())
+            all_values.append(npz["y_train"].ravel())
+    test_path = directory / "test_shakespeare.npz"
+    if test_path.exists():
+        with np.load(test_path) as npz:
+            all_values.append(npz["x_test"].ravel())
+            all_values.append(npz["y_test"].ravel())
+    if not all_values:
+        raise ValueError(f"No Shakespeare partitions found in {directory}")
+    concatenated = np.concatenate(all_values)
+    return _build_lookup_from_values(concatenated)
+
+
+def remap_shakespeare(arr: np.ndarray, data_dir: str) -> Tuple[np.ndarray, int]:
+    """Remap an array of raw codepoints to contiguous ids."""
+    vocab, lookup = load_shakespeare_lookup(data_dir)
+    remapped = _remap_array(arr, lookup)
+    return remapped, len(vocab)
+
+
+def shakespeare(num_classes, input_shape, data_dir="data_partitions"):
+    data_dir = str(Path(data_dir))
+    path = _ensure_path(Path(data_dir) / "test_shakespeare.npz")
+    data = np.load(path)
+    x_test_raw = data["x_test"]
+    y_test_raw = data["y_test"]
+
+    x_test, vocab_size = remap_shakespeare(x_test_raw, data_dir)
+    y_test, _ = remap_shakespeare(y_test_raw, data_dir)
+
+    seq_len = int(x_test.shape[1])
+
+    # Empty training arrays (central evaluation only)
+    x_train = np.empty((0, seq_len), dtype=np.int32)
+    y_train = np.empty((0,), dtype=np.int32)
+    input_shape = [seq_len]
+    num_classes = vocab_size
+    return x_train, y_train, x_test, y_test, input_shape, num_classes
+
+
+def cifar10(num_classes, input_shape):
+    """Prepare the CIFAR-10.
+
+    This method considers CIFAR-10 for creating both train and test sets. The sets are
+    already normalized.
+    """
+    print(f">>> [Dataset] Loading CIFAR-10. {num_classes} | {input_shape}.")
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+    x_train = x_train.astype("float32") / 255
+    x_test = x_test.astype("float32") / 255
+    input_shape = x_train.shape[1:]
+    num_classes = len(np.unique(y_train))
+
+    return x_train, y_train, x_test, y_test, input_shape, num_classes
+
+
+def fmnist(num_classes, input_shape):
+    """Prepare the FMNIST.
+
+    This method considers FMNIST for creating both train and test sets. The sets are
+    already normalized.
+    """
+    print(f">>> [Dataset] Loading FMNIST. {num_classes} | {input_shape}.")
+    (x_train, y_train), (x_test, y_test) = keras.datasets.fashion_mnist.load_data()
+    x_train = x_train.astype("float32") / 255
+    x_test = x_test.astype("float32") / 255
+    # Expand channel dimension to (H, W, 1)
+    if x_train.ndim == 3:
+        x_train = x_train[..., None]
+    if x_test.ndim == 3:
+        x_test = x_test[..., None]
+    # Use the requested input_shape/num_classes (caller controls these)
+    input_shape = x_train.shape[1:]
+    num_classes = int(num_classes)
+
+    return x_train, y_train, x_test, y_test, input_shape, num_classes
+
+
+def partition(x_train, y_train, num_clients, concentration):
+    """Create non-iid partitions.
+
+    The partitions uses a LDA distribution based on concentration.
+    """
+    print(
+        f">>> [Dataset] {num_clients} clients, non-iid concentration {concentration}..."
+    )
+    dataset = [x_train, y_train]
+    partitions, _ = create_lda_partitions(
+        dataset,
+        num_partitions=num_clients,
+        # concentration=concentration * num_classes,
+        concentration=concentration,
+        seed=1234,
+    )
+    return partitions

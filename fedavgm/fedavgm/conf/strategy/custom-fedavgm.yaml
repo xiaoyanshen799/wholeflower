@@ -1,0 +1,16 @@
+---
+_target_: fedavgm.strategy.CustomFedAvgM
+min_available_clients: ${num_clients}
+fraction_fit: ${server.reporting_fraction}
+fraction_evaluate: ${fraction_evaluate}
+server_learning_rate: ${server.learning_rate}
+server_momentum: ${server.momentum}
+downlink_quantization_enabled: ${quantization.enabled}
+downlink_quantization_bits: ${quantization.num_bits}
+downlink_error_feedback: ${quantization.error_feedback}
+on_fit_config_fn:
+  _target_: fedavgm.server.get_on_fit_config
+  config: ${client}
+initial_parameters:
+  _target_: fedavgm.models.model_to_parameters
+  model: ${model}

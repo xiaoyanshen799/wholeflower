@@ -1,0 +1,4 @@
+_target_: fedavgm.dataset.shakespeare
+num_classes: 65536        # 实际会在 loader 里替换成 max(label)+1
+input_shape: [80]         # Shakespeare 默认序列长度
+data_dir: ${hydra:runtime.cwd}/fedavgm/data_partitions

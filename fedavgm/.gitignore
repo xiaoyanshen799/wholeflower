@@ -13,6 +13,7 @@ dist/
 *.egg-info/
 
 # Data and Logs
+data_partitions/
 data_partitions1/
 data_partitions_new/
 data_for_s3/

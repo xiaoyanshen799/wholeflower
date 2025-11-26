@@ -78,6 +78,18 @@ def main() -> None:
         default=8,
         help="Quantization bit-width for server-to-client payloads (0 disables downlink compression)",
     )
+    parser.add_argument(
+        "--eval-sample-size",
+        type=int,
+        default=0,
+        help="If >0, evaluate server model on a random subset of this many test samples per round",
+    )
+    parser.add_argument(
+        "--eval-sample-seed",
+        type=int,
+        default=None,
+        help="Random seed used when sampling evaluation examples (ignored when --eval-sample-size=0)",
+    )
 
     args = parser.parse_args()
 
@@ -93,7 +105,8 @@ def main() -> None:
         f.write(
             "dataset={dataset} model={model} rounds={rounds} clients={clients} "
             "local_epochs={local_epochs} batch_size={batch_size} reporting_fraction={reporting_fraction} "
-            "server_lr={server_lr} server_momentum={server_momentum} downlink_num_bits={downlink_num_bits}\n".format(
+            "server_lr={server_lr} server_momentum={server_momentum} downlink_num_bits={downlink_num_bits} "
+            "eval_sample_size={eval_sample_size}\n".format(
                 dataset=args.dataset,
                 model=args.model,
                 rounds=args.rounds,
@@ -104,6 +117,7 @@ def main() -> None:
                 server_lr=args.server_lr,
                 server_momentum=args.server_momentum,
                 downlink_num_bits=args.downlink_num_bits,
+                eval_sample_size=args.eval_sample_size,
             )
         )
     model_builders = {
@@ -123,7 +137,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
     fit_config_fn = get_on_fit_config(cfg)
-    evaluate_fn = get_evaluate_fn(model, x_test, y_test, args.rounds, num_classes, log_path=str(log_file))
+    sample_size = args.eval_sample_size if args.eval_sample_size > 0 else None
+    evaluate_fn = get_evaluate_fn(
+        model,
+        x_test,
+        y_test,
+        args.rounds,
+        num_classes,
+        log_path=str(log_file),
+        sample_size=sample_size,
+        sample_seed=args.eval_sample_seed,
+    )
 
     # ------------------------------------------------------------------
     # Select strategy

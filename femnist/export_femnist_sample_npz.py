@@ -155,16 +155,63 @@ def load_selected_user_data(selected: List[UserRecord]) -> Dict[str, Tuple[np.nd
 
     return result
 
+def load_split_user_data(
+    selected: List[UserRecord],
+    train_dir: Path,
+    test_dir: Path,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    # 先把选中用户的 id 收集一下，方便过滤
+    target_users = {r.user_id for r in selected}
 
-def save_npz_partitions(output_dir: Path, selected_data: Dict[str, Tuple[np.ndarray, np.ndarray]], seed: int) -> None:
+    train_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    test_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    # 辅助函数：把某个目录下所有 json 扫一遍，收集需要的用户
+    def load_split_dir(split_dir: Path, dest: Dict[str, Tuple[np.ndarray, np.ndarray]]):
+        shard_files = sorted(split_dir.glob("*.json"))
+        for shard in shard_files:
+            with open(shard, "r") as f:
+                data = json.load(f)
+            user_data = data["user_data"]
+            for uid in user_data.keys():
+                if uid not in target_users or uid in dest:
+                    continue
+                ud = user_data[uid]
+                x_flat: List[List[int]] = ud["x"]
+                y_list: List[int] = ud["y"]
+                x = np.asarray(x_flat, dtype=np.uint8)
+                if x.ndim != 2 or x.shape[1] != 784:
+                    raise ValueError(f"Unexpected shape for user {uid}: {x.shape}")
+                x = x.reshape((-1, 28, 28, 1))
+                y = np.asarray(y_list, dtype=np.int64)
+                dest[uid] = (x, y)
+
+    # 分别加载 train / test
+    load_split_dir(train_dir, train_data)
+    load_split_dir(test_dir, test_data)
+
+    # 组装成统一的 selected_data
+    result: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    for rec in selected:
+        uid = rec.user_id
+        x_tr, y_tr = train_data.get(uid, (np.empty((0, 28, 28, 1), dtype=np.uint8),
+                                          np.empty((0,), dtype=np.int64)))
+        x_te, y_te = test_data.get(uid, (np.empty((0, 28, 28, 1), dtype=np.uint8),
+                                          np.empty((0,), dtype=np.int64)))
+        result[uid] = (x_tr, y_tr, x_te, y_te)
+
+    return result
+
+
+def save_npz_partitions(output_dir: Path, selected_data: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], seed: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # Assign sequential cids 0..N-1 in a deterministic order
     users_sorted = sorted(selected_data.keys())
     pad = max(5, len(str(len(users_sorted) - 1)))
     for cid, uid in enumerate(users_sorted):
-        x, y = selected_data[uid]
+        x_tr, y_tr, x_te, y_te = selected_data[uid]
         out_file = output_dir / f"client_{cid:0{pad}d}.npz"
-        np.savez_compressed(out_file, x_train=x, y_train=y)
+        np.savez_compressed(out_file, x_train=x_tr, y_train=y_tr, x_test=x_te, y_test=y_te)
 
 
 def main() -> None:
@@ -202,8 +249,12 @@ def main() -> None:
         selected.extend(rng.sample(remaining_pool, k=need))
 
     # 4) Load selected users' data
-    selected_data = load_selected_user_data(selected)
+    # selected_data = load_selected_user_data(selected)
+    data_root = args.leaf_root.parent   # .../data/femnist/data
+    train_dir = data_root / "train"
+    test_dir = data_root / "test"
 
+    selected_data = load_split_user_data(selected, train_dir, test_dir)
     # 5) Save NPZ partitions with sequential cids
     save_npz_partitions(args.output_dir, selected_data, args.seed)
 

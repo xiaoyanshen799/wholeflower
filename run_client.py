@@ -45,15 +45,19 @@ def _load_partition(data_dir: pathlib.Path, cid: int) -> tuple[np.ndarray, np.nd
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower client.")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0-indexed)")
-    parser.add_argument("--server", required=True, help="Server address host:port")
+    parser.add_argument("--server", help="Server address host:port")
     parser.add_argument("--data-dir", default="data_partitions", help="Directory containing partition files")
     parser.add_argument("--num-classes", type=int, default=10, help="Total number of classes in dataset")
     parser.add_argument("--model", default="resnet20", choices=["cnn", "tf_example", "resnet20"], help="Model architecture")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for local model")
     parser.add_argument("--epochs", type=int, default=1, help="Local epochs per round (overrides server config if desired)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for local training")
+    parser.add_argument("--local-only", action="store_true", help="Run a single local training pass to measure time (no server)")
+    parser.add_argument("--local-rounds", type=int, default=1, help="Number of repeated local-only rounds to run")
 
     args = parser.parse_args()
+    if not args.local_only and not args.server:
+        parser.error("--server is required unless --local-only is set")
 
     # ------------------------------------------------------------------
     # Configure logging to a file per client
@@ -96,6 +100,27 @@ def main() -> None:
     }
 
     client = FlowerClient(x_train, y_train, x_val, y_val, model_cfg, num_classes)
+
+    if args.local_only:
+        rounds = max(1, args.local_rounds)
+        print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
+        params = client.get_parameters({})
+        total_time = 0.0
+        for r in range(1, rounds + 1):
+            _, _, metrics = client.fit(
+                params,
+                {"local_epochs": args.epochs, "batch_size": args.batch_size},
+            )
+            params = client.get_parameters({})
+            train_time = metrics.get("train_time")
+            if isinstance(train_time, (int, float)):
+                total_time += float(train_time)
+                print(f"[Round {r}] train_time={train_time:.2f}s on {len(x_train)} samples")
+            else:
+                print(f"[Round {r}] training finished.")
+        if rounds > 1 and total_time > 0:
+            print(f"Total train time over {rounds} round(s): {total_time:.2f}s")
+        return
 
     print(f">>> Client {args.cid} connecting to {args.server}…")
     fl.client.start_numpy_client(server_address=args.server, client=client)

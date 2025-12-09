@@ -51,7 +51,7 @@ def _load_partition(data_dir: pathlib.Path, cid: int) -> tuple[np.ndarray, np.nd
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower client.")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0-indexed)")
-    parser.add_argument("--server", required=True, help="Server address host:port")
+    parser.add_argument("--server", help="Server address host:port")
     parser.add_argument("--data-dir", default="data_partitions1", help="Directory containing partition files")
     parser.add_argument("--num-classes", type=int, default=10, help="Total number of classes in dataset")
     parser.add_argument(
@@ -82,8 +82,21 @@ def main() -> None:
         default=8,
         help="Quantization bit-width for client-to-server payloads (0 disables uplink compression)",
     )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Run a single local training pass to measure time (no server connection)",
+    )
+    parser.add_argument(
+        "--local-rounds",
+        type=int,
+        default=1,
+        help="Number of repeated local-only rounds to run when --local-only is set",
+    )
 
     args = parser.parse_args()
+    if not args.local_only and not args.server:
+        parser.error("--server is required unless --local-only is set")
     print(f"--- Client {args.cid}: Parsed arguments.")
 
     # ------------------------------------------------------------------
@@ -146,6 +159,34 @@ def main() -> None:
         quantization_bits=uplink_bits if uplink_bits != 0 else 8,
     )
     print(f"--- Client {args.cid}: FlowerClient initialized successfully.")
+
+    if args.local_only:
+        # Run one local training pass to measure time without contacting server.
+        rounds = max(1, args.local_rounds)
+        print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
+        params = client.get_parameters({})
+        # Fall back to sensible defaults if overrides are not provided.
+        epochs = args.epochs if args.epochs is not None else 1
+        batch_size = args.batch_size if args.batch_size is not None else 64
+        total_time = 0.0
+        for r in range(1, rounds + 1):
+            _, _, metrics = client.fit(
+                params,
+                {"local_epochs": epochs, "batch_size": batch_size},
+            )
+            params = client.get_parameters({})
+            train_time = metrics.get("train_time")
+            if isinstance(train_time, (int, float)):
+                total_time += float(train_time)
+                print(
+                    f"[Round {r}] train_time={train_time:.2f}s on {len(x_train)} samples "
+                    f"(epochs={epochs}, batch_size={batch_size})"
+                )
+            else:
+                print(f"[Round {r}] training finished.")
+        if rounds > 1 and total_time > 0:
+            print(f"Total train time over {rounds} round(s): {total_time:.2f}s")
+        return
 
     print(f">>> Client {args.cid} connecting to {args.server}…")
     fl.client.start_numpy_client(server_address=args.server, client=client)

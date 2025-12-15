@@ -1,5 +1,9 @@
 import argparse
 from datetime import datetime
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
 import flwr as fl
@@ -16,6 +20,7 @@ from fedavgm.models import (
 )
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
 from strategy import QuantizedFedAvgM
+from baseline_selection import FedCSStrategy, TiFLStrategy
 import grpc
 from concurrent import futures
 max_message_length: int = 536_870_912
@@ -52,9 +57,18 @@ def _load_dataset(name: str):
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
     parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist")
-    parser.add_argument("--strategy", default="custom-fedavgm", choices=["fedavg", "fedavgm", "custom-fedavgm"], help="Aggregation strategy")
+    parser.add_argument(
+        "--strategy",
+        default="custom-fedavgm",
+        choices=["fedavg", "fedavgm", "custom-fedavgm", "fedcs", "tifl"],
+        help="Aggregation strategy",
+    )
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
     parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
     parser.add_argument("--reporting-fraction", type=float, default=0.1, help="Fraction of clients selected per round")
@@ -90,8 +104,131 @@ def main() -> None:
         default=None,
         help="Random seed used when sampling evaluation examples (ignored when --eval-sample-size=0)",
     )
+    parser.add_argument(
+        "--round-deadline",
+        type=float,
+        default=180.0,
+        help="FedCS: per-round deadline T_round in seconds.",
+    )
+    parser.add_argument(
+        "--fedcs-default-train",
+        "--fedcs-default-num-samples",
+        type=int,
+        default=300,
+        help="FedCS: default local sample count when no data-dir is provided.",
+    )
+    parser.add_argument(
+        "--profile-http-port",
+        type=int,
+        default=0,
+        help="If set (>0), start an HTTP endpoint for clients to probe bandwidth.",
+    )
+    parser.add_argument(
+        "--profile-http-host",
+        default="127.0.0.1",
+        help="Host used to construct profile URL passed to clients (e.g., 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--profile-bytes",
+        type=int,
+        default=262144,
+        help="Bytes transferred in download/upload probes when profiling bandwidth.",
+    )
+    parser.add_argument(
+        "--fedcs-properties-timeout",
+        type=float,
+        default=60.0,
+        help="FedCS: timeout (seconds) for per-client get_properties during Resource Request.",
+    )
+    parser.add_argument(
+        "--tifl-tiers",
+        type=int,
+        default=4,
+        help="TiFL: number of latency tiers to build.",
+    )
+    parser.add_argument(
+        "--tifl-interval",
+        type=int,
+        default=20,
+        help="TiFL: periodic re-profiling interval (rounds); 0 disables.",
+    )
+    parser.add_argument(
+        "--tifl-fast-bias",
+        type=float,
+        default=0.6,
+        help="TiFL (legacy, ignored): fast-tier bias from the old heuristic implementation.",
+    )
+    parser.add_argument(
+        "--tifl-sync-rounds",
+        type=int,
+        default=5,
+        help="TiFL: number of profiling rounds used for tiering (sync_rounds).",
+    )
+    parser.add_argument(
+        "--tifl-profile-warmup-rounds",
+        type=int,
+        default=2,
+        help="TiFL: warmup profiling rounds to ignore (e.g., first-round overhead).",
+    )
+    parser.add_argument(
+        "--tifl-tmax",
+        type=float,
+        default=60.0,
+        help="TiFL: Tmax seconds for profiling timeout/capping.",
+    )
+    parser.add_argument(
+        "--tifl-prob-update-interval",
+        type=int,
+        default=20,
+        help="TiFL: probability update interval I in Algorithm 2.",
+    )
+    parser.add_argument(
+        "--tifl-credits",
+        type=int,
+        default=None,
+        help="TiFL: Credits per tier (Algorithm 2); omit for unlimited.",
+    )
 
     args = parser.parse_args()
+
+    profile_url = None
+    if args.profile_http_port and args.profile_http_port > 0:
+        profile_url = f"http://{args.profile_http_host}:{args.profile_http_port}"
+
+        class _ProfileHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                parsed = urlparse(self.path)
+                if parsed.path != "/download":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                qs = parse_qs(parsed.query)
+                n = int(qs.get("bytes", ["0"])[0] or "0")
+                n = max(0, min(n, 5 * 1024 * 1024))
+                payload = b"\0" * n
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):  # noqa: N802
+                if self.path != "/upload":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                _ = self.rfile.read(length) if length > 0 else b""
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, fmt, *args2):  # silence default http.server logging
+                return
+
+        httpd = HTTPServer(("0.0.0.0", int(args.profile_http_port)), _ProfileHandler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        logging.info("[Profile] HTTP probe server started at %s", profile_url)
 
     # ------------------------------------------------------------------
     # Build initial model to obtain parameter shapes
@@ -120,6 +257,11 @@ def main() -> None:
                 eval_sample_size=args.eval_sample_size,
             )
         )
+    # Also mirror Python logging output into the per-run server log file.
+    file_handler = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(file_handler)
     model_builders = {
         "cnn": cnn,
         "tf_example": tf_example,
@@ -175,6 +317,46 @@ def main() -> None:
             initial_parameters=initial_parameters,
             server_learning_rate=args.server_lr,
             server_momentum=args.server_momentum,
+        )
+    elif args.strategy == "fedcs":
+        strategy = FedCSStrategy(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            server_learning_rate=args.server_lr,
+            server_momentum=args.server_momentum,
+            csv_log_path=args.csv_path,
+            downlink_quantization_enabled=args.downlink_num_bits != 0,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 8,
+            round_deadline_s=args.round_deadline,
+            resource_request_fraction=args.reporting_fraction,
+            profile_url=profile_url,
+            profile_bytes=args.profile_bytes,
+            properties_timeout_s=args.fedcs_properties_timeout,
+        )
+    elif args.strategy == "tifl":
+        strategy = TiFLStrategy(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            server_learning_rate=args.server_lr,
+            server_momentum=args.server_momentum,
+            csv_log_path=args.csv_path,
+            downlink_quantization_enabled=args.downlink_num_bits != 0,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 8,
+            num_tiers=args.tifl_tiers,
+            sync_rounds=args.tifl_sync_rounds,
+            profile_warmup_rounds=args.tifl_profile_warmup_rounds,
+            tmax_s=args.tifl_tmax,
+            prob_update_interval=args.tifl_prob_update_interval,
+            credits_per_tier=args.tifl_credits,
+            reprofiling_interval_rounds=args.tifl_interval,
         )
     else:  # custom-fedavgm (default)
         strategy = QuantizedFedAvgM(

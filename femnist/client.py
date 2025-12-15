@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import resource
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Dict, Optional, Tuple
 import flwr as fl
 from hydra.utils import instantiate
 from keras.utils import to_categorical
+import tensorflow as tf
 
 from compression import ErrorFeedbackQuantizer, maybe_unpack_quantized
 
@@ -83,6 +85,8 @@ class FlowerClient(fl.client.NumPyClient):
         error_feedback: bool = True,
         local_epochs_override: Optional[int] = None,
         batch_size_override: Optional[int] = None,
+        # FedCS/TiFL-style resource profile (optional, used by server-side selection)
+        profile: Optional[Dict[str, float]] = None,
     ) -> None:
         target = model_cfg.get("_target_", "") if isinstance(model_cfg, dict) else ""
         use_sparse = target.endswith("char_rnn")
@@ -118,11 +122,15 @@ class FlowerClient(fl.client.NumPyClient):
 
         self._local_epochs_override = local_epochs_override
         self._batch_size_override = batch_size_override
+        self._profile = dict(profile or {})
+        self._profile_cache: Dict[str, float] = {}
+        self._profile_cache_ts: float = 0.0
 
     def get_parameters(self, config):  # pylint: disable=unused-argument
         return self.model.get_weights()
 
     def fit(self, parameters, config):
+        fit_start = time.time()
         decode_start = time.time()
         received_parameters, was_quantized = maybe_unpack_quantized(list(parameters))
         if was_quantized:
@@ -235,6 +243,7 @@ class FlowerClient(fl.client.NumPyClient):
             metrics["train_time"] = float(train_duration)
             metrics["edcode"] = float(decode_time + encode_time)
             metrics["client_fit_end_time"] = float(fit_end)
+            metrics["fit_elapsed_s"] = float(fit_end - fit_start)
             return packed_weights, len(self.x_train), metrics
 
         metrics["quant_applied"] = 0.0
@@ -248,6 +257,7 @@ class FlowerClient(fl.client.NumPyClient):
         metrics["train_time"] = float(train_duration)
         metrics["edcode"] = float(decode_time + encode_time)
         metrics["client_fit_end_time"] = float(fit_end)
+        metrics["fit_elapsed_s"] = float(fit_end - fit_start)
         return weights, len(self.x_train), metrics
 
     def evaluate(self, parameters, config):  # pylint: disable=unused-argument
@@ -255,6 +265,179 @@ class FlowerClient(fl.client.NumPyClient):
         loss, acc = self.model.evaluate(self.x_val, self.y_val, verbose=False)
         logging.info("Client %s  val_acc=%.4f  loss=%.4f", config.get("cid", "?"), acc, loss)
         return loss, len(self.x_val), {"accuracy": acc}
+
+    def get_properties(self, config):  # pylint: disable=unused-argument
+        """Return resource profile for FedCS-style client selection.
+
+        Keys are intentionally generic and compatible with common baselines:
+        - b_down_bps / b_up_bps: downlink/uplink throughput in bits/sec
+        - f_samples_per_s: compute capability in samples/sec
+        - n_samples: local training samples available
+        """
+        # Cache to keep get_properties lightweight (server may call per-round).
+        refresh_s = float(config.get("profile_refresh_s", 60.0)) if isinstance(config, dict) else 60.0
+        now = time.time()
+        if self._profile_cache and (now - self._profile_cache_ts) < refresh_s:
+            return dict(self._profile_cache)
+
+        profile: Dict[str, float] = dict(self._profile)
+        profile["n_samples"] = float(len(self.x_train))
+
+        # Compute profiling: estimate samples/sec using a short GradientTape run (no weight update).
+        if "f_samples_per_s" not in profile or profile.get("f_samples_per_s", 0.0) <= 0:
+            prof_sps = self._profile_compute_samples_per_s(
+                batch_size=int(config.get("profile_batch_size", 64)) if isinstance(config, dict) else 64,
+                steps=int(config.get("profile_steps", 1)) if isinstance(config, dict) else 1,
+                warmup_steps=int(config.get("profile_warmup_steps", 3)) if isinstance(config, dict) else 3,
+                runs=int(config.get("profile_runs", 2)) if isinstance(config, dict) else 2,
+                discard_first=bool(config.get("profile_discard_first", True)) if isinstance(config, dict) else True,
+            )
+            if prof_sps is not None and prof_sps > 0:
+                profile["f_samples_per_s"] = float(prof_sps)
+
+        # Bandwidth probing (optional): server can provide profile_url for HTTP probe endpoint.
+        profile_url = None
+        if isinstance(config, dict):
+            profile_url = config.get("profile_url")
+        if not profile_url:
+            profile_url = os.environ.get("FEDCS_PROFILE_URL")
+
+        probe_bytes = int(config.get("profile_bytes", 262144)) if isinstance(config, dict) else 262144
+        probe_timeout = float(config.get("profile_timeout_s", 5.0)) if isinstance(config, dict) else 5.0
+        if profile_url and probe_bytes > 0:
+            down_bps, up_bps = self._probe_bandwidth_bps(
+                str(profile_url),
+                num_bytes=probe_bytes,
+                timeout_s=probe_timeout,
+            )
+            if down_bps:
+                profile["b_down_bps"] = float(down_bps)
+            if up_bps:
+                profile["b_up_bps"] = float(up_bps)
+
+        self._profile_cache = dict(profile)
+        self._profile_cache_ts = now
+        logging.info("[Profile] %s", self._profile_cache)
+        return profile
+
+    def _profile_compute_samples_per_s(
+        self,
+        *,
+        batch_size: int,
+        steps: int,
+        warmup_steps: int = 3,
+        runs: int = 2,
+        discard_first: bool = True,
+    ) -> Optional[float]:
+        """Estimate compute capability (samples/sec) without mutating weights."""
+        batch_size = max(1, int(batch_size))
+        steps = max(1, int(steps))
+        warmup_steps = max(0, int(warmup_steps))
+        runs = max(1, int(runs))
+        if len(self.x_train) < batch_size:
+            return None
+
+        x = tf.convert_to_tensor(self.x_train[:batch_size])
+        y = tf.convert_to_tensor(self.y_train[:batch_size])
+        if y.shape.rank is None:
+            return None
+
+        if y.shape.rank == 1:
+            loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+        else:
+            loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+
+        def _one_step() -> None:
+            with tf.GradientTape() as tape:
+                preds = self.model(x, training=True)
+                loss = loss_fn(y, preds)
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            _ = [tf.reduce_sum(g) for g in grads if g is not None]
+
+        # Warmup to avoid first-call tracing/initialization costs.
+        for _ in range(warmup_steps):
+            _one_step()
+
+        sps_runs: List[float] = []
+        last_elapsed = None
+        for _ in range(runs):
+            start = time.time()
+            for _ in range(steps):
+                _one_step()
+            elapsed = time.time() - start
+            last_elapsed = elapsed
+            if elapsed > 0:
+                sps_runs.append((steps * batch_size) / elapsed)
+
+        if not sps_runs:
+            return None
+        if discard_first and len(sps_runs) >= 2:
+            sps = sps_runs[-1]
+        else:
+            sps = sum(sps_runs) / float(len(sps_runs))
+
+        # Estimate update time as t_ud = E * n / f (paper), using local_epochs from env if available.
+        # If not set, assume 1 epoch for the estimate shown in logs.
+        local_epochs_env = os.environ.get("FEDCS_LOCAL_EPOCHS")
+        try:
+            local_epochs = int(local_epochs_env) if local_epochs_env else 1
+        except ValueError:
+            local_epochs = 1
+        est_t_ud = (local_epochs * float(len(self.x_train))) / float(sps) if sps > 0 else float("nan")
+
+        logging.info(
+            "[Profile][Compute] batch=%s steps=%s warmup=%s runs=%s discard_first=%s "
+            "elapsed_last=%.3fs sps=%.3f n_samples=%s local_epochs=%s est_t_ud=%.3fs",
+            batch_size,
+            steps,
+            warmup_steps,
+            runs,
+            discard_first,
+            float(last_elapsed or 0.0),
+            float(sps),
+            len(self.x_train),
+            local_epochs,
+            float(est_t_ud),
+        )
+
+        return float(sps)
+
+    def _probe_bandwidth_bps(
+        self, base_url: str, *, num_bytes: int, timeout_s: float
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Probe down/up bandwidth to the server's optional profile HTTP endpoint."""
+        import urllib.parse
+        import urllib.request
+
+        num_bytes = max(1, int(num_bytes))
+        timeout_s = max(0.1, float(timeout_s))
+        base_url = base_url.rstrip("/")
+
+        down_bps = None
+        up_bps = None
+        try:
+            q = urllib.parse.urlencode({"bytes": str(num_bytes)})
+            url = f"{base_url}/download?{q}"
+            t0 = time.time()
+            data = urllib.request.urlopen(url, timeout=timeout_s).read()
+            t1 = time.time()
+            if data:
+                down_bps = (len(data) * 8.0) / max(1e-6, (t1 - t0))
+        except Exception as exc:
+            logging.warning("[Profile] download probe failed: %s", exc)
+
+        try:
+            url = f"{base_url}/upload"
+            payload = bytearray(num_bytes)
+            req = urllib.request.Request(url, data=payload, method="POST")
+            t0 = time.time()
+            urllib.request.urlopen(req, timeout=timeout_s).read()
+            t1 = time.time()
+            up_bps = (num_bytes * 8.0) / max(1e-6, (t1 - t0))
+        except Exception as exc:
+            logging.warning("[Profile] upload probe failed: %s", exc)
+
+        return down_bps, up_bps
 
 
 def generate_client_fn(

@@ -13,10 +13,21 @@ MAX_CLIENTS=${3:-0}   # 0 = 启动目录里所有 client_*.npz
 
 PY=${PY:-python3}
 
-# 当前项目目录（你在 femnist 代码根目录下执行脚本就行）
-PROJECT_DIR=$(pwd)
+# 运行哪个用户（默认当前用户）；之前写死 ubuntu 会导致 217/USER，客户端根本没起来
+RUN_AS_USER=${RUN_AS_USER:-"$(id -un)"}
+
+# systemd 运行模式：auto（优先 --user）、user、system
+SYSTEMD_MODE=${SYSTEMD_MODE:-auto}
+
+# femnist 项目目录（脚本所在目录），避免从别的路径执行导致 working-directory/data-dir 错乱
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # 把 data_dir 变成绝对路径，避免工作目录不同导致找不到
-DATA_DIR_ABS=$(readlink -f "$DATA_DIR")
+if [[ "$DATA_DIR" = /* ]]; then
+  DATA_DIR_ABS=$(readlink -f "$DATA_DIR")
+else
+  DATA_DIR_ABS=$(readlink -f "$PROJECT_DIR/$DATA_DIR")
+fi
 
 ENV_VARS=(
   --setenv=OMP_NUM_THREADS=1
@@ -31,33 +42,111 @@ echo "Data dir    : $DATA_DIR_ABS"
 echo "Server      : $SERVER"
 echo "Max clients : ${MAX_CLIENTS:-all}"
 echo "Python      : $PY"
+echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
 echo
 
 shopt -s nullglob
 
+if [[ "$SYSTEMD_MODE" == "auto" ]]; then
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    SYSTEMD_MODE="user"
+  else
+    SYSTEMD_MODE="system"
+  fi
+fi
+
+SYSTEMD_RUN=(systemd-run)
+SYSTEMCTL=(systemctl)
+JOURNALCTL=(journalctl)
+if [[ "$SYSTEMD_MODE" == "user" ]]; then
+  SYSTEMD_RUN+=(--user)
+  SYSTEMCTL+=(--user)
+  JOURNALCTL+=(--user)
+else
+  # system 模式下需要 root 创建 transient unit
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    SYSTEMD_RUN=(sudo "${SYSTEMD_RUN[@]}")
+    SYSTEMCTL=(sudo "${SYSTEMCTL[@]}")
+    JOURNALCTL=(sudo "${JOURNALCTL[@]}")
+  fi
+fi
+
+# 运行完成（包括失败）后自动卸载 transient unit，避免下次 --unit 同名冲突
+SYSTEMD_RUN+=(--collect)
+
+cleanup_unit() {
+  local unit="$1"
+
+  # If the unit exists from a previous run, stop/reset it first to avoid:
+  # "Unit ... was already loaded or has a fragment file."
+  if "${SYSTEMCTL[@]}" list-units --type=service --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
+    echo "  Found existing unit: $unit; stopping/resetting it first..."
+    "${SYSTEMCTL[@]}" stop "$unit" >/dev/null 2>&1 || true
+    "${SYSTEMCTL[@]}" kill "$unit" >/dev/null 2>&1 || true
+    "${SYSTEMCTL[@]}" reset-failed "$unit" >/dev/null 2>&1 || true
+    # Give systemd a moment to GC collected transient units.
+    for _ in {1..20}; do
+      if ! "${SYSTEMCTL[@]}" list-units --type=service --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+}
+
 count=0
-for f in "$DATA_DIR"/client_*.npz; do
+for f in "$DATA_DIR_ABS"/client_*.npz; do
   base=$(basename "$f")        # client_00035.npz
   cid=${base#client_}          # 00035.npz
   cid=${cid%.npz}              # 00035
   cid=$((10#$cid))             # 去掉前导 0，转成整数
 
-  echo "Starting client for $base (cid=$cid)"
+  unit="fl_client_${cid}"
+  log_file="$DATA_DIR_ABS/${base%.npz}.log"
 
-  sudo systemd-run \
-    -p CPUQuota=18.6% -p CPUQuotaPeriodSec=200ms \
-    --uid=ubuntu \
-    --working-directory="$PROJECT_DIR" \
-    "${ENV_VARS[@]}" \
-    --unit="fl_client_${cid}" \
-    "$PY" -m run_client \
-      --cid "$cid" \
-      --server "$SERVER" \
-      --data-dir "$DATA_DIR_ABS" \
-      --model mobilenet_v2_100 \
-      --num-classes 62 \
-      --uplink-num-bits 0
+  echo "Starting client for $base (cid=$cid)"
+  echo "  unit : $unit"
+  echo "  log  : $log_file"
+
+  cleanup_unit "$unit"
+
+  client_cmd=(
+    "$PY" -m run_client
+    --cid "$cid"
+    --server "$SERVER"
+    --data-dir "$DATA_DIR_ABS"
+    --model mobilenet_v2_100
+    --num-classes 62
+    --uplink-num-bits 0
+  )
+
+  cmd_str="$(printf '%q ' "${client_cmd[@]}")"
+  log_q="$(printf '%q' "$log_file")"
+
+  if [[ "$SYSTEMD_MODE" == "system" ]]; then
+    "${SYSTEMD_RUN[@]}" \
+      -p CPUQuota=18.6% -p CPUQuotaPeriodSec=200ms \
+      --uid="$RUN_AS_USER" \
+      --working-directory="$PROJECT_DIR" \
+      "${ENV_VARS[@]}" \
+      --unit="$unit" \
+      /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1"
+  else
+    "${SYSTEMD_RUN[@]}" \
+      -p CPUQuota=18.6% -p CPUQuotaPeriodSec=200ms \
+      --working-directory="$PROJECT_DIR" \
+      "${ENV_VARS[@]}" \
+      --unit="$unit" \
+      /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1"
+  fi
+
+  # 如果 unit 立即失败，直接给出原因（常见：用户/环境/模块路径）
+  if ! "${SYSTEMCTL[@]}" is-active --quiet "$unit"; then
+    echo "  WARN: $unit is not active; check:"
+    echo "    ${SYSTEMCTL[*]} status $unit -n 50 --no-pager"
+    echo "    ${JOURNALCTL[*]} -u $unit -n 100 --no-pager"
+  fi
 
   count=$((count + 1))
   if [[ "$MAX_CLIENTS" -gt 0 && "$count" -ge "$MAX_CLIENTS" ]]; then

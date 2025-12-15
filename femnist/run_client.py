@@ -93,6 +93,24 @@ def main() -> None:
         default=1,
         help="Number of repeated local-only rounds to run when --local-only is set",
     )
+    parser.add_argument(
+        "--profile-down-mbps",
+        type=float,
+        default=None,
+        help="FedCS profile: average downlink throughput (Mbps) reported via get_properties.",
+    )
+    parser.add_argument(
+        "--profile-up-mbps",
+        type=float,
+        default=None,
+        help="FedCS profile: average uplink throughput (Mbps) reported via get_properties.",
+    )
+    parser.add_argument(
+        "--profile-compute-sps",
+        type=float,
+        default=None,
+        help="FedCS profile: compute capability (samples/sec) reported via get_properties.",
+    )
 
     args = parser.parse_args()
     if not args.local_only and not args.server:
@@ -146,6 +164,15 @@ def main() -> None:
 
     print(f"--- Client {args.cid}: Initializing FlowerClient (and TF model)...")
     uplink_bits = args.uplink_num_bits
+    # Optional: allow overriding profile values via CLI, otherwise the client will
+    # profile itself (compute) and optionally probe bandwidth when requested by server.
+    profile = {}
+    if args.profile_down_mbps is not None:
+        profile["b_down_bps"] = float(args.profile_down_mbps) * 1_000_000.0
+    if args.profile_up_mbps is not None:
+        profile["b_up_bps"] = float(args.profile_up_mbps) * 1_000_000.0
+    if args.profile_compute_sps is not None:
+        profile["f_samples_per_s"] = float(args.profile_compute_sps)
     client = FlowerClient(
         x_train,
         y_train,
@@ -157,6 +184,7 @@ def main() -> None:
         batch_size_override=args.batch_size,
         enable_compression=uplink_bits != 0,
         quantization_bits=uplink_bits if uplink_bits != 0 else 8,
+        profile=profile,
     )
     print(f"--- Client {args.cid}: FlowerClient initialized successfully.")
 

@@ -1,20 +1,10 @@
 import argparse
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import flwr as fl
-from omegaconf import OmegaConf
 
-from fedavgm.dataset import cifar10, fmnist, femnist_dataset
-from fedavgm.models import (
-    cnn,
-    model_to_parameters,
-    mobilenet_v2_075,
-    mobilenet_v2_100,
-    resnet20_keras,
-    tf_example,
-)
-from fedavgm.server import get_on_fit_config, get_evaluate_fn
 from strategy import QuantizedFedAvgM
 import grpc
 from concurrent import futures
@@ -41,6 +31,8 @@ grpc.server = _srv
 
 def _load_dataset(name: str):
     """Return (x_train, y_train, x_test, y_test, input_shape, num_classes)."""
+    from fedavgm.dataset import cifar10, fmnist, femnist_dataset
+
     name = name.lower()
     if name in {"cifar", "cifar10", "cifar-10"}:
         return cifar10(num_classes=10, input_shape=[32, 32, 3])
@@ -51,9 +43,17 @@ def _load_dataset(name: str):
     raise ValueError(f"Unsupported dataset '{name}'.")
 
 
+def _is_ixi(name: str) -> bool:
+    return name.lower() in {"ixi", "fed-ixi", "fed_ixi", "fedixi"}
+
+
+def _is_isic(name: str) -> bool:
+    return name.lower() in {"isic", "isic2019", "fed-isic2019", "fed_isic2019"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
-    parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist")
+    parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist | femnist | ixi | isic")
     parser.add_argument("--strategy", default="custom-fedavgm", choices=["fedavg", "fedavgm", "custom-fedavgm"], help="Aggregation strategy")
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
     parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
@@ -71,6 +71,9 @@ def main() -> None:
     parser.add_argument("--client-lr", type=float, default=0.05, help="Client learning rate (to build initial model)")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
     parser.add_argument("--csv-path", default="logs/comm_times.csv", help="CSV file to log per-round per-client timing metrics")
+    parser.add_argument("--data-root", default="data/fed_ixi", help="Fed-IXI dataset root (IXI_sample folder inside)")
+    parser.add_argument("--isic-preprocessed-dir", default="ISIC_2019_Training_Input_preprocessed", help="ISIC preprocessed image folder (relative to --data-root)")
+    parser.add_argument("--isic-split-csv", default=None, help="Path to ISIC train_test_split file")
     parser.add_argument(
         "--downlink-num-bits",
         type=int,
@@ -93,10 +96,45 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if _is_ixi(args.dataset) and "--batch-size" not in sys.argv:
+        args.batch_size = 2
+    if _is_isic(args.dataset) and "--batch-size" not in sys.argv:
+        args.batch_size = 32
+
     # ------------------------------------------------------------------
     # Build initial model to obtain parameter shapes
     # ------------------------------------------------------------------
-    x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(args.dataset)
+    use_ixi = _is_ixi(args.dataset)
+    use_isic = _is_isic(args.dataset)
+    if use_ixi:
+        import torch
+        from flwr.common import ndarrays_to_parameters
+
+        from ixi_flower import evaluate_ixi, get_model_parameters
+        from ixi_model import UNet3D
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = UNet3D(in_channels=1, out_channels=2, base=8).to(device)
+        initial_parameters = ndarrays_to_parameters(get_model_parameters(model))
+        input_shape = (1, 48, 60, 48)
+        num_classes = 2
+        x_train = y_train = x_test = y_test = None
+    elif use_isic:
+        import torch
+        from flwr.common import ndarrays_to_parameters
+
+        from isic_flower import evaluate_isic, get_model_parameters
+        from isic_model import build_efficientnet
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = build_efficientnet(num_classes=8, pretrained=True).to(device)
+        initial_parameters = ndarrays_to_parameters(get_model_parameters(model))
+        input_shape = (3, 200, 200)
+        num_classes = 8
+        x_train = y_train = x_test = y_test = None
+    else:
+        x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(args.dataset)
+        model = None
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -120,34 +158,111 @@ def main() -> None:
                 eval_sample_size=args.eval_sample_size,
             )
         )
-    model_builders = {
-        "cnn": cnn,
-        "tf_example": tf_example,
-        "resnet20": resnet20_keras,
-        "mobilenet_v2_075": mobilenet_v2_075,
-        "mobilenet_v2_100": mobilenet_v2_100,
-    }
-    build_model = model_builders[args.model]
+    if not use_ixi and not use_isic:
+        from fedavgm.models import (
+            cnn,
+            model_to_parameters,
+            mobilenet_v2_075,
+            mobilenet_v2_100,
+            resnet20_keras,
+            tf_example,
+        )
 
-    model = build_model(input_shape, num_classes, args.client_lr)
-    initial_parameters = model_to_parameters(model)
+        model_builders = {
+            "cnn": cnn,
+            "tf_example": tf_example,
+            "resnet20": resnet20_keras,
+            "mobilenet_v2_075": mobilenet_v2_075,
+            "mobilenet_v2_100": mobilenet_v2_100,
+        }
+        build_model = model_builders[args.model]
+
+        model = build_model(input_shape, num_classes, args.client_lr)
+        initial_parameters = model_to_parameters(model)
 
     # ------------------------------------------------------------------
     # Fit/eval configuration helpers
     # ------------------------------------------------------------------
-    cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
-    fit_config_fn = get_on_fit_config(cfg)
+    if use_ixi or use_isic:
+        import time
+
+        def fit_config_fn(server_round: int):  # pylint: disable=unused-argument
+            return {
+                "local_epochs": args.local_epochs,
+                "batch_size": args.batch_size,
+                "confit_time": time.time(),
+                "server_send_time": time.time(),
+            }
+    else:
+        from omegaconf import OmegaConf
+        from fedavgm.server import get_on_fit_config, get_evaluate_fn
+
+        cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
+        fit_config_fn = get_on_fit_config(cfg)
     sample_size = args.eval_sample_size if args.eval_sample_size > 0 else None
-    evaluate_fn = get_evaluate_fn(
-        model,
-        x_test,
-        y_test,
-        args.rounds,
-        num_classes,
-        log_path=str(log_file),
-        sample_size=sample_size,
-        sample_seed=args.eval_sample_seed,
-    )
+    if use_ixi:
+        from flwr.common import parameters_to_ndarrays
+
+        def evaluate_fn(server_round: int, parameters, config):  # pylint: disable=unused-argument
+            if hasattr(parameters, "tensors"):
+                params_list = parameters_to_ndarrays(parameters)
+            else:
+                params_list = parameters
+            loss, dice = evaluate_ixi(
+                model,
+                params_list,
+                data_root=args.data_root,
+                device=device,
+                batch_size=1,
+                num_workers=0,
+                sample_size=sample_size,
+                sample_seed=args.eval_sample_seed,
+            )
+            if log_file:
+                entry = (
+                    f"round={server_round} loss={loss:.6f} dice={dice:.6f} "
+                    f"samples={sample_size or 'all'}\n"
+                )
+                Path(log_file).open("a", encoding="utf-8").write(entry)
+            return loss, {"dice": dice}
+    elif use_isic:
+        from flwr.common import parameters_to_ndarrays
+
+        def evaluate_fn(server_round: int, parameters, config):  # pylint: disable=unused-argument
+            if hasattr(parameters, "tensors"):
+                params_list = parameters_to_ndarrays(parameters)
+            else:
+                params_list = parameters
+            loss, bal_acc = evaluate_isic(
+                model,
+                params_list,
+                data_root=args.data_root,
+                device=device,
+                split_csv=args.isic_split_csv,
+                preprocessed_dir=args.isic_preprocessed_dir,
+                batch_size=args.batch_size,
+                num_workers=0,
+                sample_size=sample_size,
+                sample_seed=args.eval_sample_seed,
+            )
+            if log_file:
+                entry = (
+                    f"round={server_round} loss={loss:.6f} balanced_accuracy={bal_acc:.6f} "
+                    f"samples={sample_size or 'all'}\n"
+                )
+                Path(log_file).open("a", encoding="utf-8").write(entry)
+            return loss, {"balanced_accuracy": bal_acc}
+    else:
+        evaluate_fn = get_evaluate_fn(
+            model,
+            x_test,
+            y_test,
+            args.rounds,
+            num_classes,
+            log_path=str(log_file),
+            sample_size=sample_size,
+            sample_seed=args.eval_sample_seed,
+        )
 
     # ------------------------------------------------------------------
     # Select strategy

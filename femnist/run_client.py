@@ -4,14 +4,6 @@ import pathlib
 import flwr as fl
 import logging
 import numpy as np
-import tensorflow as tf
-
-# Force TensorFlow to use a single worker thread so training time reflects
-# actual compute instead of thread-pool throttling on constrained devices.
-tf.config.threading.set_intra_op_parallelism_threads(1)
-tf.config.threading.set_inter_op_parallelism_threads(1)
-
-from client import FlowerClient
 
 # --- add: gRPC keepalive monkey patch (client) ---
 import grpc
@@ -52,7 +44,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower client.")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0-indexed)")
     parser.add_argument("--server", help="Server address host:port")
+    parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist | femnist | ixi")
     parser.add_argument("--data-dir", default="data_partitions1", help="Directory containing partition files")
+    parser.add_argument("--data-root", default="data/fed_ixi", help="Fed-IXI dataset root (IXI_sample folder inside)")
+    parser.add_argument("--center", default=None, help="Fed-IXI center name or id (Guys/HH/IOP or 0/1/2)")
+    parser.add_argument("--isic-preprocessed-dir", default="ISIC_2019_Training_Input_preprocessed", help="ISIC preprocessed image folder (relative to --data-root)")
+    parser.add_argument("--isic-split-csv", default=None, help="Path to ISIC train_test_split file")
     parser.add_argument("--num-classes", type=int, default=10, help="Total number of classes in dataset")
     parser.add_argument(
         "--model",
@@ -93,11 +90,135 @@ def main() -> None:
         default=1,
         help="Number of repeated local-only rounds to run when --local-only is set",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Seed for IXI train/val split")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for IXI")
+    parser.add_argument("--device", default=None, help="cpu or cuda (IXI only)")
 
     args = parser.parse_args()
     if not args.local_only and not args.server:
         parser.error("--server is required unless --local-only is set")
     print(f"--- Client {args.cid}: Parsed arguments.")
+
+    dataset = args.dataset.lower()
+    is_ixi = dataset in {"ixi", "fed-ixi", "fed_ixi", "fedixi"}
+    is_isic = dataset in {"isic", "isic2019", "fed-isic2019", "fed_isic2019"}
+
+    if is_ixi:
+        import torch
+
+        from ixi_flower import IXIFlowerClient
+
+        center = args.center if args.center is not None else args.cid
+        device = (
+            torch.device(args.device)
+            if args.device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        default_bs = 2
+        init_bs = args.batch_size if args.batch_size is not None else default_bs
+        bs_override = args.batch_size if args.batch_size is not None else None
+
+        client = IXIFlowerClient(
+            data_root=args.data_root,
+            center=center,
+            device=device,
+            batch_size=init_bs,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            learning_rate=args.lr,
+            local_epochs_override=args.epochs,
+            batch_size_override=bs_override,
+            enable_compression=args.uplink_num_bits != 0,
+            quantization_bits=args.uplink_num_bits if args.uplink_num_bits != 0 else 8,
+        )
+
+        if args.local_only:
+            rounds = max(1, args.local_rounds)
+            print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
+            params = client.get_parameters({})
+            epochs = args.epochs if args.epochs is not None else 1
+            batch_size = args.batch_size if args.batch_size is not None else default_bs
+            for r in range(1, rounds + 1):
+                _, _, metrics = client.fit(
+                    params,
+                    {"local_epochs": epochs, "batch_size": batch_size},
+                )
+                params = client.get_parameters({})
+                train_time = metrics.get("train_time")
+                if isinstance(train_time, (int, float)):
+                    print(f"[Round {r}] train_time={train_time:.2f}s")
+                else:
+                    print(f"[Round {r}] training finished.")
+            return
+
+        print(f">>> Client {args.cid} connecting to {args.server}…")
+        fl.client.start_numpy_client(server_address=args.server, client=client)
+        print(f"--- Client {args.cid}: Flower client finished.")
+        return
+
+    if is_isic:
+        import torch
+
+        from isic_flower import IsicFlowerClient
+
+        center = args.center if args.center is not None else args.cid
+        device = (
+            torch.device(args.device)
+            if args.device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        default_bs = 32
+        init_bs = args.batch_size if args.batch_size is not None else default_bs
+        bs_override = args.batch_size if args.batch_size is not None else None
+
+        client = IsicFlowerClient(
+            data_root=args.data_root,
+            center=int(center),
+            device=device,
+            batch_size=init_bs,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            learning_rate=args.lr,
+            local_epochs_override=args.epochs,
+            batch_size_override=bs_override,
+            split_csv=args.isic_split_csv,
+            preprocessed_dir=args.isic_preprocessed_dir,
+            enable_compression=args.uplink_num_bits != 0,
+            quantization_bits=args.uplink_num_bits if args.uplink_num_bits != 0 else 8,
+        )
+
+        if args.local_only:
+            rounds = max(1, args.local_rounds)
+            print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
+            params = client.get_parameters({})
+            epochs = args.epochs if args.epochs is not None else 1
+            batch_size = args.batch_size if args.batch_size is not None else default_bs
+            for r in range(1, rounds + 1):
+                _, _, metrics = client.fit(
+                    params,
+                    {"local_epochs": epochs, "batch_size": batch_size},
+                )
+                params = client.get_parameters({})
+                train_time = metrics.get("train_time")
+                if isinstance(train_time, (int, float)):
+                    print(f"[Round {r}] train_time={train_time:.2f}s")
+                else:
+                    print(f"[Round {r}] training finished.")
+            return
+
+        print(f">>> Client {args.cid} connecting to {args.server}…")
+        fl.client.start_numpy_client(server_address=args.server, client=client)
+        print(f"--- Client {args.cid}: Flower client finished.")
+        return
+
+    import tensorflow as tf
+
+    # Force TensorFlow to use a single worker thread so training time reflects
+    # actual compute instead of thread-pool throttling on constrained devices.
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+
+    from client import FlowerClient
 
     # ------------------------------------------------------------------
     # Configure logging to a file per client

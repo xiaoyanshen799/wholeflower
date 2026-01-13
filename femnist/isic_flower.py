@@ -215,7 +215,7 @@ class IsicFlowerClient(fl.client.NumPyClient):
         if isinstance(server_to_client_ms, (int, float)):
             metrics["server_to_client_ms"] = float(server_to_client_ms)
         metrics["train_time"] = float(duration)
-
+        metrics["client_fit_end_time"] = float(time.time())
         if self._quantizer is not None:
             packed, report = self._quantizer.encode(weights)
             metrics.update(report.as_metrics())

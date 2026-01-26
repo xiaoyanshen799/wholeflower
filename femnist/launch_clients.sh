@@ -16,11 +16,14 @@ PY=${PY:-python3}
 # 运行哪个用户（默认当前用户）；之前写死 ubuntu 会导致 217/USER，客户端根本没起来
 RUN_AS_USER=${RUN_AS_USER:-"$(id -un)"}
 
-# systemd 运行模式：auto（优先 --user）、user、system
-SYSTEMD_MODE=${SYSTEMD_MODE:-auto}
+# 强制使用 systemd system + scope 模式（与旧的 --scope 行为一致）
+SYSTEMD_MODE="system"
 
 # femnist 项目目录（脚本所在目录），避免从别的路径执行导致 working-directory/data-dir 错乱
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Optional: CSV mapping client_id -> new_cpu (fraction 0-1). If set, use per-client CPUQuota.
+CPU_MAP_CSV=${CPU_MAP_CSV:-"$PROJECT_DIR/../logs/client_num_examples.csv"}
 
 # 把 data_dir 变成绝对路径，避免工作目录不同导致找不到
 if [[ "$DATA_DIR" = /* ]]; then
@@ -44,50 +47,39 @@ echo "Max clients : ${MAX_CLIENTS:-all}"
 echo "Python      : $PY"
 echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
+echo "CPU map CSV : $CPU_MAP_CSV"
+echo "CPU affinity: disabled"
 echo
 
 shopt -s nullglob
 
-if [[ "$SYSTEMD_MODE" == "auto" ]]; then
-  if systemctl --user show-environment >/dev/null 2>&1; then
-    SYSTEMD_MODE="user"
-  else
-    SYSTEMD_MODE="system"
-  fi
-fi
-
 SYSTEMD_RUN=(systemd-run)
 SYSTEMCTL=(systemctl)
 JOURNALCTL=(journalctl)
-if [[ "$SYSTEMD_MODE" == "user" ]]; then
-  SYSTEMD_RUN+=(--user)
-  SYSTEMCTL+=(--user)
-  JOURNALCTL+=(--user)
-else
-  # system 模式下需要 root 创建 transient unit
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    SYSTEMD_RUN=(sudo "${SYSTEMD_RUN[@]}")
-    SYSTEMCTL=(sudo "${SYSTEMCTL[@]}")
-    JOURNALCTL=(sudo "${JOURNALCTL[@]}")
-  fi
+# system 模式下需要 root 创建 transient unit
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  SYSTEMD_RUN=(sudo "${SYSTEMD_RUN[@]}")
+  SYSTEMCTL=(sudo "${SYSTEMCTL[@]}")
+  JOURNALCTL=(sudo "${JOURNALCTL[@]}")
 fi
 
 # 运行完成（包括失败）后自动卸载 transient unit，避免下次 --unit 同名冲突
-SYSTEMD_RUN+=(--collect)
+# --no-block: 不阻塞当前 shell，允许循环继续启动下一个 client
+SYSTEMD_RUN+=(--collect --scope --no-block)
 
 cleanup_unit() {
   local unit="$1"
 
   # If the unit exists from a previous run, stop/reset it first to avoid:
   # "Unit ... was already loaded or has a fragment file."
-  if "${SYSTEMCTL[@]}" list-units --type=service --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
+  if "${SYSTEMCTL[@]}" list-units --type=scope --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
     echo "  Found existing unit: $unit; stopping/resetting it first..."
     "${SYSTEMCTL[@]}" stop "$unit" >/dev/null 2>&1 || true
     "${SYSTEMCTL[@]}" kill "$unit" >/dev/null 2>&1 || true
     "${SYSTEMCTL[@]}" reset-failed "$unit" >/dev/null 2>&1 || true
     # Give systemd a moment to GC collected transient units.
     for _ in {1..20}; do
-      if ! "${SYSTEMCTL[@]}" list-units --type=service --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
+      if ! "${SYSTEMCTL[@]}" list-units --type=scope --all --no-legend "$unit" 2>/dev/null | awk '{print $1}' | grep -qx "$unit"; then
         break
       fi
       sleep 0.1
@@ -96,6 +88,16 @@ cleanup_unit() {
 }
 
 count=0
+launch_pids=()
+declare -A CLIENT_CPU
+if [[ -f "$CPU_MAP_CSV" ]]; then
+  while IFS=, read -r cid _ _ new_cpu; do
+    [[ "$cid" == "client_id" || -z "$cid" ]] && continue
+    cid=$(echo "$cid" | tr -d ' \t\r')
+    new_cpu=$(echo "$new_cpu" | tr -d ' \t\r')
+    CLIENT_CPU["$cid"]="$new_cpu"
+  done < "$CPU_MAP_CSV"
+fi
 for f in "$DATA_DIR_ABS"/client_*.npz; do
   base=$(basename "$f")        # client_00035.npz
   cid=${base#client_}          # 00035.npz
@@ -103,49 +105,44 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cid=$((10#$cid))             # 去掉前导 0，转成整数
 
   unit="fl_client_${cid}"
+  unit_name="${unit}.scope"
   log_file="$DATA_DIR_ABS/${base%.npz}.log"
 
   echo "Starting client for $base (cid=$cid)"
-  echo "  unit : $unit"
+  echo "  unit : $unit_name"
   echo "  log  : $log_file"
 
-  cleanup_unit "$unit"
+  cleanup_unit "$unit_name"
 
   client_cmd=(
-    "$PY" -m run_client
+    "$PY" "$PROJECT_DIR/run_client.py"
     --cid "$cid"
     --server "$SERVER"
     --data-dir "$DATA_DIR_ABS"
-    --model mobilenet_v2_100
-    --num-classes 62
+    --model cnn
+    --num-classes 10
     --uplink-num-bits 0
   )
 
   cmd_str="$(printf '%q ' "${client_cmd[@]}")"
   log_q="$(printf '%q' "$log_file")"
 
-  if [[ "$SYSTEMD_MODE" == "system" ]]; then
-    "${SYSTEMD_RUN[@]}" \
-      -p CPUQuota=18.6% -p CPUQuotaPeriodSec=200ms \
-      --uid="$RUN_AS_USER" \
-      --working-directory="$PROJECT_DIR" \
-      "${ENV_VARS[@]}" \
-      --unit="$unit" \
-      /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1"
-  else
-    "${SYSTEMD_RUN[@]}" \
-      -p CPUQuota=18.6% -p CPUQuotaPeriodSec=200ms \
-      --working-directory="$PROJECT_DIR" \
-      "${ENV_VARS[@]}" \
-      --unit="$unit" \
-      /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1"
-  fi
+  cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
+  cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
+  "${SYSTEMD_RUN[@]}" \
+    -p CPUAccounting=yes -p CPUQuota="$cpu_quota" -p CPUQuotaPeriodSec=200ms \
+    --uid="$RUN_AS_USER" \
+    --working-directory="$PROJECT_DIR" \
+    "${ENV_VARS[@]}" \
+    --unit="$unit" \
+    /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1" &
+  launch_pids+=("$!")
 
   # 如果 unit 立即失败，直接给出原因（常见：用户/环境/模块路径）
-  if ! "${SYSTEMCTL[@]}" is-active --quiet "$unit"; then
-    echo "  WARN: $unit is not active; check:"
-    echo "    ${SYSTEMCTL[*]} status $unit -n 50 --no-pager"
-    echo "    ${JOURNALCTL[*]} -u $unit -n 100 --no-pager"
+  if ! "${SYSTEMCTL[@]}" is-active --quiet "$unit_name"; then
+    echo "  WARN: $unit_name is not active; check:"
+    echo "    ${SYSTEMCTL[*]} status $unit_name -n 50 --no-pager"
+    echo "    ${JOURNALCTL[*]} -u $unit_name -n 100 --no-pager"
   fi
 
   count=$((count + 1))
@@ -153,6 +150,10 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
     echo "Reached MAX_CLIENTS=$MAX_CLIENTS, stop launching more."
     break
   fi
+done
+
+for pid in "${launch_pids[@]}"; do
+  wait "$pid" || true
 done
 
 if [[ $count -eq 0 ]]; then

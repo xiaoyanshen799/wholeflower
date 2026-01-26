@@ -38,6 +38,25 @@ def fmnist(num_classes, input_shape):
     return x_train, y_train, x_test, y_test, input_shape, num_classes
 
 
+def mnist(num_classes, input_shape):
+    """Prepare the MNIST.
+
+    This method considers MNIST for creating both train and test sets. The sets are
+    normalized and reshaped to (H, W, 1).
+    """
+    print(f">>> [Dataset] Loading MNIST. {num_classes} | {input_shape}.")
+    (x_train, y_train), (x_test, y_test) = keras.datasets.mnist.load_data()
+    x_train = x_train.astype("float32") / 255
+    x_test = x_test.astype("float32") / 255
+    if x_train.ndim == 3:
+        x_train = np.expand_dims(x_train, axis=-1)
+        x_test = np.expand_dims(x_test, axis=-1)
+    input_shape = x_train.shape[1:]
+    num_classes = len(np.unique(y_train))
+
+    return x_train, y_train, x_test, y_test, input_shape, num_classes
+
+
 def partition(x_train, y_train, num_clients, concentration):
     """Create non-iid partitions.
 

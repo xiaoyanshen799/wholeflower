@@ -137,6 +137,8 @@ def main() -> None:
         x_full = x_full.astype(np.float32)
     if x_full.max() > 1.0:
         x_full /= 255.0
+    if x_full.ndim == 3:
+        x_full = np.expand_dims(x_full, axis=-1)
 
     # 90-10 split into train / validation (same rule as baseline)
     split_idx = int(0.9 * len(x_full))

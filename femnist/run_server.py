@@ -9,7 +9,7 @@ from pathlib import Path
 import flwr as fl
 from omegaconf import OmegaConf
 
-from fedavgm.dataset import cifar10, fmnist, femnist_dataset
+from fedavgm.dataset import cifar10, fmnist, mnist, femnist_dataset
 from fedavgm.models import (
     cnn,
     model_to_parameters,
@@ -49,6 +49,8 @@ def _load_dataset(name: str):
     name = name.lower()
     if name in {"cifar", "cifar10", "cifar-10"}:
         return cifar10(num_classes=10, input_shape=[32, 32, 3])
+    if name in {"mnist"}:
+        return mnist(num_classes=10, input_shape=[28, 28, 1])
     if name in {"fmnist", "fashionmnist", "fashion-mnist"}:
         return fmnist(num_classes=10, input_shape=[28, 28, 1])
     if name in {"femnist"}:
@@ -62,7 +64,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
-    parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist")
+    parser.add_argument("--dataset", default="cifar10", help="cifar10 | mnist | fmnist | femnist")
     parser.add_argument(
         "--strategy",
         default="custom-fedavgm",
@@ -71,7 +73,7 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
     parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
-    parser.add_argument("--reporting-fraction", type=float, default=0.1, help="Fraction of clients selected per round")
+    parser.add_argument("--reporting-fraction", type=float, default=1.0, help="Fraction of clients selected per round")
     parser.add_argument("--server-lr", type=float, default=0.05, help="Server learning rate (FedAvgM)")
     parser.add_argument(
         "--model",

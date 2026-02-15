@@ -12,15 +12,13 @@ SSH_OPTS="-o StrictHostKeyChecking=accept-new"  # 老机器不支持时可换成
 SSH_PASSWORD="abacus"
 # 需要额外同步的文件（使用项目根目录的相对路径，保持目录结构）
 PATCH_FILES=(
-  "femnist/client.py"
-  "femnist/fedavgm/strategy.py"
 )
 # ====================
 
 ZIP="$PROJECT_DIR/shakespeare.zip"
 CLIENT_DIR="$PROJECT_DIR/femnist/data_partitions"
 SYNC_ZIP=false              # 设为 true 则继续同步 ZIP
-SYNC_CLIENT_DATA=false      # 设为 true 则继续同步 client_*.npz
+SYNC_CLIENT_DATA=true      # 设为 true 则继续同步 client_*.npz
 
 # 如果需要同步 ZIP / client 数据，则检查文件是否存在
 if $SYNC_ZIP; then

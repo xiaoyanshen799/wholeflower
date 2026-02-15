@@ -237,6 +237,12 @@ class QuantizedFedAvgM(FedAvg):
                 for client_proxy, fit_res in results:
                     cid = getattr(client_proxy, "cid", "?")
                     m = fit_res.metrics or {}
+                    logging.info(
+                        "[Server][Metrics] round=%s client=%s keys=%s",
+                        server_round,
+                        cid,
+                        sorted(m.keys()),
+                    )
                     stc = m.get("server_to_client_ms", None)
                     swt = m.get("server_wait_time", None)
                     train_s = m.get("train_time", None)

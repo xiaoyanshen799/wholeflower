@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/femnist/logs/server_20251101_161424.csv"
+csv_file = "/home/ubuntu/wholeflower/femnist/logs/stackoverflow_60.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -15,10 +15,11 @@ df = pd.read_csv(csv_file)
 
 # 数据存储
 client_durations = defaultdict(list)
+client_num_examples = {}
 client_colors = {}
 empirical_cdfs = {}
 
-MAX_DURATION = 430.0
+MAX_DURATION = 1000.0
 
 
 # 从 CSV 中提取客户端时长信息
@@ -29,6 +30,8 @@ for _, row in df.iterrows():
     round_time = row["client_train_s"]  # 任务完成时长
     # round_time = row["client_train_s"] 
     client_durations[client_id].append({"duration": round_time})  # 存储时长
+    if client_id not in client_num_examples:
+        client_num_examples[client_id] = row["num_examples"]
 
 
 from scipy.stats import lognorm, weibull_min, t
@@ -69,6 +72,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
         for r in records
         if "duration" in r and r["duration"] <= MAX_DURATION
     ]
+    num_examples = client_num_examples.get(client, 0)
     durations.sort()
     if not durations:
         continue
@@ -107,7 +111,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
         p0 = [theta0, max(k0, 0.1)]
 
         bounds = ([min(x_data), 0.05],     # k ≥ 0.05 s
-                [max(x_data), 300.0])
+                [max(x_data), 1000.0])
 
         popt, _ = curve_fit(logistic_cdf, x_data, y_data,
                             p0=p0, bounds=bounds,
@@ -125,7 +129,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
         # print("Weibull:",   "SSE=", sse_weib, "AIC=", aic_weib)
         # print("LogNormal:","SSE=", sse_logn, "AIC=", aic_logn)
         theta_hat, k_hat = popt
-        print(f"[Logistic Fit] Client {client} => theta = {theta_hat:.4f}, k = {k_hat:.4f}")
+        print(f"[Logistic Fit] Client {client} num_examples {num_examples} => theta = {theta_hat:.4f}, k = {k_hat:.4f}")
 
         # 存储到 client_params 里
         client_params[client] = (theta_hat, k_hat)
@@ -369,12 +373,12 @@ if _round_col is not None:
         per_round_time_sorted = np.sort(per_round_time)
         per_round_cdf = np.arange(1, len(per_round_time_sorted) + 1) / float(len(per_round_time_sorted))
 
-        plt.plot(
-            per_round_time_sorted,
-            per_round_cdf,
-            "-", linewidth=2.5,
-            label="Actual per-round max (≤35s)"
-        )
+        # plt.plot(
+        #     per_round_time_sorted,
+        #     per_round_cdf,
+        #     "-", linewidth=2.5,
+        #     label="Actual per-round max (≤35s)"
+        # )
 
 
 plt.xlabel("Time (s)")

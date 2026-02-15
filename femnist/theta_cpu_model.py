@@ -73,7 +73,7 @@ for i, (cid, sub) in enumerate(df.groupby("id"), start=0):
     #     p0=p0_k, bounds=(0, np.inf), maxfev=10_000)
 
     # ------ CPU that yields θ = 50 -----------------------------------------
-    target_theta = 30.0
+    target_theta = 40.0
     if a_th <= 0 or b_th == 0 or target_theta <= g_th:
         cpu_50 = np.nan
     else:

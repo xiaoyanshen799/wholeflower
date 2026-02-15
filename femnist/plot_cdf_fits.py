@@ -154,14 +154,18 @@ def main() -> None:
 
         x, y = make_empirical_cdf(times)
 
-        # Fit lambda for model1
+        # Fit lambda for model1; emphasize right half of the CDF (larger t / higher y)
         try:
+            weights = np.where(y >= 0.6, 3.0, 1.0)  # boost tail influence
+            sigma = 1.0 / np.sqrt(weights)
             popt, _ = curve_fit(
                 model1,
                 x,
                 y,
                 p0=[1.0],
                 bounds=([0.0], [np.inf]),
+                sigma=sigma,
+                absolute_sigma=False,
                 maxfev=20000,
             )
             lam = float(popt[0])

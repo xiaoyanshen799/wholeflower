@@ -9,14 +9,31 @@ from pathlib import Path
 import flwr as fl
 from omegaconf import OmegaConf
 
-from fedavgm.dataset import cifar10, fmnist, mnist, femnist_dataset
+from fedavgm.dataset import (
+    cifar10,
+    femnist_dataset,
+    fmnist,
+    load_stackoverflow_meta,
+    mnist,
+    shakespeare,
+    speech_commands,
+    stackoverflow,
+)
 from fedavgm.models import (
     cnn,
     model_to_parameters,
     mobilenet_v2_075,
     mobilenet_v2_100,
+    resnet18_keras,
     resnet20_keras,
+    cifar10_resnet,
     tf_example,
+    char_lstm2,
+    speech_cnn_small,
+    embed_avg_mlp,
+    embed_bilstm_mlp,
+    embed_avg_mlp_bce,
+    embed_bilstm_mlp_bce,
 )
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
 from strategy import QuantizedFedAvgM
@@ -44,7 +61,18 @@ def _srv(executor=None, options=None, *a, **k):
 grpc.server = _srv
 
 
-def _load_dataset(name: str):
+def _resolve_path(candidates):
+    """Return first existing Path from candidates."""
+    for cand in candidates:
+        if cand is None:
+            continue
+        p = Path(cand)
+        if p.exists():
+            return p
+    return None
+
+
+def _load_dataset(name: str, *, shakespeare_dir=None, speech_dir=None, stackoverflow_dir=None):
     """Return (x_train, y_train, x_test, y_test, input_shape, num_classes)."""
     name = name.lower()
     if name in {"cifar", "cifar10", "cifar-10"}:
@@ -55,6 +83,41 @@ def _load_dataset(name: str):
         return fmnist(num_classes=10, input_shape=[28, 28, 1])
     if name in {"femnist"}:
         return femnist_dataset()
+    if name in {"shakespeare"}:
+        base = _resolve_path(
+            [
+                shakespeare_dir,
+                Path("data_partitions_shakespeare"),
+                Path(__file__).resolve().parent / "data_partitions_shakespeare",
+            ]
+        )
+        if base is None:
+            raise FileNotFoundError("Could not find Shakespeare partitions (try --data-dir-shakespeare)")
+        return shakespeare(num_classes=65536, input_shape=[80], data_dir=base)
+    if name in {"speech_commands", "speech"}:
+        base = _resolve_path(
+            [
+                speech_dir,
+                Path("data_partitions_speech_commands"),
+                Path(__file__).resolve().parent / "data_partitions_speech_commands",
+            ]
+        )
+        if base is None:
+            raise FileNotFoundError("Could not find Speech Commands partitions (try --data-dir-speech)")
+        return speech_commands(num_classes=12, input_shape=[98, 64, 1], data_dir=base)
+    if name in {"stackoverflow", "stack_overflow", "stack-overflow"}:
+        if stackoverflow_dir is not None and not Path(stackoverflow_dir).exists():
+            raise FileNotFoundError(f"StackOverflow partitions not found: {Path(stackoverflow_dir)}")
+        base = _resolve_path(
+            [
+                stackoverflow_dir,
+                Path("data_partitions_stackoverflow"),
+                Path(__file__).resolve().parent / "data_partitions_stackoverflow",
+            ]
+        )
+        if base is None:
+            raise FileNotFoundError("Could not find StackOverflow partitions (try --data-dir-stackoverflow)")
+        return stackoverflow(num_classes=0, input_shape=[0], data_dir=str(base))
     raise ValueError(f"Unsupported dataset '{name}'.")
 
 
@@ -64,7 +127,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
-    parser.add_argument("--dataset", default="cifar10", help="cifar10 | mnist | fmnist | femnist")
+    parser.add_argument(
+        "--dataset",
+        default="cifar10",
+        choices=[
+            "cifar10",
+            "mnist",
+            "fmnist",
+            "femnist",
+            "shakespeare",
+            "speech_commands",
+            "stackoverflow",
+        ],
+        help="cifar10 | mnist | fmnist | femnist | shakespeare | speech_commands | stackoverflow",
+    )
     parser.add_argument(
         "--strategy",
         default="custom-fedavgm",
@@ -74,24 +150,46 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
     parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
     parser.add_argument("--reporting-fraction", type=float, default=1.0, help="Fraction of clients selected per round")
-    parser.add_argument("--server-lr", type=float, default=0.05, help="Server learning rate (FedAvgM)")
+    parser.add_argument("--server-lr", type=float, default=0.01, help="Server learning rate (FedAvgM)")
     parser.add_argument(
         "--model",
         default="resnet20",
-        choices=["cnn", "tf_example", "resnet20", "mobilenet_v2_075", "mobilenet_v2_100"],
+        choices=[
+            "cnn",
+            "tf_example",
+            "resnet18",
+            "resnet20",
+            "cifar10_resnet",
+            "mobilenet_v2_075",
+            "mobilenet_v2_100",
+            "char_lstm2",
+            "speech_cnn_small",
+            "embed_avg_mlp",
+            "embed_bilstm_mlp",
+            "embed_avg_mlp_bce",
+            "embed_bilstm_mlp_bce",
+        ],
         help="Model architecture",
     )
     parser.add_argument("--server-momentum", type=float, default=0.9, help="Server momentum (FedAvgM)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Client local epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Client batch size")
-    parser.add_argument("--client-lr", type=float, default=0.05, help="Client learning rate (to build initial model)")
+    parser.add_argument("--client-lr", type=float, default=0.01, help="Client learning rate (to build initial model)")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
     parser.add_argument("--csv-path", default="logs/comm_times.csv", help="CSV file to log per-round per-client timing metrics")
+    parser.add_argument("--data-dir-shakespeare", type=Path, default=None, help="Path to Shakespeare partitions (optional)")
+    parser.add_argument("--data-dir-speech", type=Path, default=None, help="Path to Speech Commands partitions (optional)")
+    parser.add_argument(
+        "--data-dir-stackoverflow",
+        type=Path,
+        default=None,
+        help="Path to StackOverflow partitions (optional)",
+    )
     parser.add_argument(
         "--downlink-num-bits",
         type=int,
         choices=[0, 8, 16],
-        default=8,
+        default=0,
         help="Quantization bit-width for server-to-client payloads (0 disables downlink compression)",
     )
     parser.add_argument(
@@ -235,7 +333,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Build initial model to obtain parameter shapes
     # ------------------------------------------------------------------
-    x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(args.dataset)
+    x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(
+        args.dataset,
+        shakespeare_dir=args.data_dir_shakespeare,
+        speech_dir=args.data_dir_speech,
+        stackoverflow_dir=args.data_dir_stackoverflow,
+    )
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -267,13 +370,63 @@ def main() -> None:
     model_builders = {
         "cnn": cnn,
         "tf_example": tf_example,
+        "resnet18": resnet18_keras,
         "resnet20": resnet20_keras,
+        "cifar10_resnet": cifar10_resnet,
         "mobilenet_v2_075": mobilenet_v2_075,
         "mobilenet_v2_100": mobilenet_v2_100,
+        "char_lstm2": char_lstm2,
+        "speech_cnn_small": speech_cnn_small,
+        "embed_avg_mlp": embed_avg_mlp,
+        "embed_bilstm_mlp": embed_bilstm_mlp,
+        "embed_avg_mlp_bce": embed_avg_mlp_bce,
+        "embed_bilstm_mlp_bce": embed_bilstm_mlp_bce,
     }
     build_model = model_builders[args.model]
 
-    model = build_model(input_shape, num_classes, args.client_lr)
+    if args.dataset.lower() == "stackoverflow":
+        is_multilabel = getattr(y_test, "ndim", 1) == 2
+        if is_multilabel:
+            allowed = {"embed_avg_mlp_bce", "embed_bilstm_mlp_bce"}
+            if args.model not in allowed:
+                raise SystemExit(
+                    "This StackOverflow partition looks multi-label (y_test is 2-D). "
+                    "Please use --model embed_avg_mlp_bce or embed_bilstm_mlp_bce."
+                )
+        else:
+            allowed = {"embed_avg_mlp", "embed_bilstm_mlp"}
+            if args.model not in allowed:
+                raise SystemExit(
+                    "This StackOverflow partition looks single-label (y_test is 1-D). "
+                    "Please use --model embed_avg_mlp or embed_bilstm_mlp."
+                )
+        base = _resolve_path(
+            [
+                args.data_dir_stackoverflow,
+                Path("data_partitions_stackoverflow"),
+                Path(__file__).resolve().parent / "data_partitions_stackoverflow",
+            ]
+        )
+        if base is None:
+            raise FileNotFoundError("Could not find StackOverflow partitions (try --data-dir-stackoverflow)")
+        meta = load_stackoverflow_meta(base)
+        model = build_model(
+            input_shape,
+            num_classes,
+            args.client_lr,
+            vocab_size=int(meta["vocab_size_total"]),
+        )
+    else:
+        if args.model in {
+            "embed_avg_mlp",
+            "embed_bilstm_mlp",
+            "embed_avg_mlp_bce",
+            "embed_bilstm_mlp_bce",
+        }:
+            raise SystemExit(
+                "--model embed_* are only supported with --dataset stackoverflow"
+            )
+        model = build_model(input_shape, num_classes, args.client_lr)
     initial_parameters = model_to_parameters(model)
 
     # ------------------------------------------------------------------
@@ -332,7 +485,7 @@ def main() -> None:
             server_momentum=args.server_momentum,
             csv_log_path=args.csv_path,
             downlink_quantization_enabled=args.downlink_num_bits != 0,
-            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 8,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 0,
             round_deadline_s=args.round_deadline,
             resource_request_fraction=args.reporting_fraction,
             profile_url=profile_url,
@@ -351,7 +504,7 @@ def main() -> None:
             server_momentum=args.server_momentum,
             csv_log_path=args.csv_path,
             downlink_quantization_enabled=args.downlink_num_bits != 0,
-            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 8,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 0,
             num_tiers=args.tifl_tiers,
             sync_rounds=args.tifl_sync_rounds,
             profile_warmup_rounds=args.tifl_profile_warmup_rounds,
@@ -372,7 +525,7 @@ def main() -> None:
             server_momentum=args.server_momentum,
             csv_log_path=args.csv_path,
             downlink_quantization_enabled=args.downlink_num_bits != 0,
-            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 8,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 0,
         )
 
     # ------------------------------------------------------------------

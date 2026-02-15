@@ -149,12 +149,27 @@ def main() -> None:
         action="store_true",
         help="Also partition the MNIST test set into per-client splits.",
     )
+    parser.add_argument(
+        "--dataset",
+        choices=["mnist", "cifar10"],
+        default="mnist",
+        help="Dataset to download/partition.",
+    )
+
     args = parser.parse_args()
 
-    from tensorflow.keras.datasets import mnist
+    from tensorflow.keras.datasets import mnist, cifar10
 
-    (x_train, y_train), (x_test, y_test) = mnist.load_data()
-    num_classes = int(np.max(y_train)) + 1
+    if args.dataset == "mnist":
+        (x_train, y_train), (x_test, y_test) = mnist.load_data()
+    else:
+        (x_train, y_train), (x_test, y_test) = cifar10.load_data()
+        # CIFAR10 labels are shape (N, 1)
+        y_train = y_train.reshape(-1)
+        y_test = y_test.reshape(-1)
+
+    num_classes = int(np.max(y_train)) + 1  # should be 10 for CIFAR10
+
 
     rng = np.random.default_rng(args.seed)
     if args.strategy == "class":
@@ -182,7 +197,7 @@ def main() -> None:
             y_train,
             num_clients=args.num_clients,
             num_classes=num_classes,
-            alpha1=alpha1,
+            alpha1=alpha1*5,
             alpha2=args.alpha2,
             rng=rng,
         )
@@ -230,7 +245,7 @@ def main() -> None:
                 y_test,
                 num_clients=args.num_clients,
                 num_classes=num_classes,
-                alpha1=alpha1,
+                alpha1=alpha1*5,
                 alpha2=args.alpha2,
                 rng=rng_test,
             )

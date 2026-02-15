@@ -87,11 +87,41 @@ class FlowerClient(fl.client.NumPyClient):
         batch_size_override: Optional[int] = None,
         # FedCS/TiFL-style resource profile (optional, used by server-side selection)
         profile: Optional[Dict[str, float]] = None,
+        train_dataset_fn=None,
+        val_dataset_fn=None,
+        train_size: Optional[int] = None,
+        val_size: Optional[int] = None,
+        use_sparse_labels: Optional[bool] = None,
     ) -> None:
-        target = model_cfg.get("_target_", "") if isinstance(model_cfg, dict) else ""
-        use_sparse = target.endswith("char_rnn")
-
+        # Instantiate model first, then detect loss type (sparse vs categorical)
         self.model = instantiate(model_cfg)
+
+        def _uses_sparse_categorical_loss(loss_obj) -> bool:
+            try:
+                if isinstance(loss_obj, str):
+                    name = loss_obj.lower()
+                else:
+                    name = loss_obj.__class__.__name__.lower()
+            except Exception:
+                name = str(loss_obj).lower()
+            return ("sparse" in name) and ("categorical" in name)
+
+        def _uses_binary_crossentropy(loss_obj) -> bool:
+            try:
+                if isinstance(loss_obj, str):
+                    name = loss_obj.lower()
+                else:
+                    name = loss_obj.__class__.__name__.lower()
+            except Exception:
+                name = str(loss_obj).lower()
+            return ("binary" in name) and ("crossentropy" in name)
+
+        if use_sparse_labels is None:
+            use_sparse = _uses_sparse_categorical_loss(self.model.loss)
+            use_binary = _uses_binary_crossentropy(self.model.loss)
+        else:
+            use_sparse = bool(use_sparse_labels)
+            use_binary = _uses_binary_crossentropy(self.model.loss)
 
         self.cid = str(cid) if cid is not None else None
         self.enable_compression = enable_compression
@@ -111,14 +141,30 @@ class FlowerClient(fl.client.NumPyClient):
                 if residuals is not None:
                     self._quantizer.set_state(residuals)
 
+        self._use_dataset = train_dataset_fn is not None
+        self._train_dataset_fn = train_dataset_fn
+        self._val_dataset_fn = val_dataset_fn
+        self._train_size = (
+            train_size if train_size is not None else (len(x_train) if x_train is not None else None)
+        )
+        self._val_size = val_size if val_size is not None else (len(x_val) if x_val is not None else None)
+
         self.x_train = x_train
         self.x_val = x_val
-        if use_sparse:
-            self.y_train = y_train
-            self.y_val = y_val
+        if self._use_dataset:
+            self.y_train = None
+            self.y_val = None
         else:
-            self.y_train = to_categorical(y_train, num_classes=num_classes)
-            self.y_val = to_categorical(y_val, num_classes=num_classes)
+            if use_binary:
+                # Multi-label targets are already multi-hot vectors.
+                self.y_train = y_train.astype("float32", copy=False)
+                self.y_val = y_val.astype("float32", copy=False)
+            elif use_sparse:
+                self.y_train = y_train
+                self.y_val = y_val
+            else:
+                self.y_train = to_categorical(y_train, num_classes=num_classes)
+                self.y_val = to_categorical(y_val, num_classes=num_classes)
 
         self._local_epochs_override = local_epochs_override
         self._batch_size_override = batch_size_override
@@ -172,14 +218,25 @@ class FlowerClient(fl.client.NumPyClient):
             batch_size,
         )
 
-        
-        self.model.fit(
-            self.x_train,
-            self.y_train,
-            epochs=epochs,
-            batch_size=batch_size,
-            verbose=False,
-        )
+        if self._use_dataset:
+            train_ds = self._train_dataset_fn(batch_size, training=True) if self._train_dataset_fn else None
+            val_ds = self._val_dataset_fn(batch_size, training=False) if self._val_dataset_fn else None
+            self.model.fit(
+                train_ds,
+                epochs=epochs,
+                verbose=False,
+                validation_data=val_ds,
+            )
+            num_train_examples = self._train_size if self._train_size is not None else 0
+        else:
+            self.model.fit(
+                self.x_train,
+                self.y_train,
+                epochs=epochs,
+                batch_size=batch_size,
+                verbose=False,
+            )
+            num_train_examples = len(self.x_train)
         train_end = time.time()
         train_duration = train_end - train_start
         cpu_freq_end = _read_cpu_freq_mhz()
@@ -244,7 +301,7 @@ class FlowerClient(fl.client.NumPyClient):
             metrics["edcode"] = float(decode_time + encode_time)
             metrics["client_fit_end_time"] = float(fit_end)
             metrics["fit_elapsed_s"] = float(fit_end - fit_start)
-            return packed_weights, len(self.x_train), metrics
+            return packed_weights, num_train_examples, metrics
 
         metrics["quant_applied"] = 0.0
         payload_bytes = sum(arr.nbytes for arr in weights)
@@ -258,13 +315,20 @@ class FlowerClient(fl.client.NumPyClient):
         metrics["edcode"] = float(decode_time + encode_time)
         metrics["client_fit_end_time"] = float(fit_end)
         metrics["fit_elapsed_s"] = float(fit_end - fit_start)
-        return weights, len(self.x_train), metrics
+        return weights, num_train_examples, metrics
 
     def evaluate(self, parameters, config):  # pylint: disable=unused-argument
         self.model.set_weights(parameters)
-        loss, acc = self.model.evaluate(self.x_val, self.y_val, verbose=False)
+        if self._use_dataset:
+            batch_size = config.get("batch_size", 32) if isinstance(config, dict) else 32
+            val_ds = self._val_dataset_fn(batch_size, training=False) if self._val_dataset_fn else None
+            loss, acc = self.model.evaluate(val_ds, verbose=False)
+            val_len = self._val_size if self._val_size is not None else 0
+        else:
+            loss, acc = self.model.evaluate(self.x_val, self.y_val, verbose=False)
+            val_len = len(self.x_val)
         logging.info("Client %s  val_acc=%.4f  loss=%.4f", config.get("cid", "?"), acc, loss)
-        return loss, len(self.x_val), {"accuracy": acc}
+        return loss, val_len, {"accuracy": acc}
 
     def get_properties(self, config):  # pylint: disable=unused-argument
         """Return resource profile for FedCS-style client selection.
@@ -281,7 +345,10 @@ class FlowerClient(fl.client.NumPyClient):
             return dict(self._profile_cache)
 
         profile: Dict[str, float] = dict(self._profile)
-        profile["n_samples"] = float(len(self.x_train))
+        train_count = (
+            self._train_size if self._train_size is not None else (len(self.x_train) if self.x_train is not None else 0)
+        )
+        profile["n_samples"] = float(train_count)
 
         # Compute profiling: estimate samples/sec using a short GradientTape run (no weight update).
         if "f_samples_per_s" not in profile or profile.get("f_samples_per_s", 0.0) <= 0:
@@ -334,6 +401,8 @@ class FlowerClient(fl.client.NumPyClient):
         steps = max(1, int(steps))
         warmup_steps = max(0, int(warmup_steps))
         runs = max(1, int(runs))
+        if self._use_dataset or self.x_train is None:
+            return None
         if len(self.x_train) < batch_size:
             return None
 

@@ -8,6 +8,26 @@ from pathlib import Path
 import numpy as np
 
 
+def _num_examples_from_npz(path: Path) -> int:
+    """
+    Return the number of examples stored in a client npz file.
+
+    Different data preparation scripts save slightly different keys. We try a
+    few common ones in order and raise a helpful error if none are found.
+    """
+    with np.load(path, allow_pickle=True) as d:
+        if "x_train" in d:  # original FEMNIST format
+            return int(d["x_train"].shape[0])
+        if "files" in d:  # speech commands partition stores file paths + labels
+            return int(d["files"].shape[0])
+        if "labels" in d:  # fallback: labels length should match examples
+            return int(d["labels"].shape[0])
+    raise KeyError(
+        f"Could not determine number of examples in {path.name}; expected one of "
+        "'x_train', 'files', or 'labels' in the archive."
+    )
+
+
 def count_client_samples(data_dir: Path) -> dict[int, int]:
     counts = {}
     for f in sorted(data_dir.glob("client_*.npz")):
@@ -16,8 +36,7 @@ def count_client_samples(data_dir: Path) -> dict[int, int]:
             cid = int(cid_str)
         except ValueError:
             continue
-        with np.load(f) as d:
-            n = int(d["x_train"].shape[0])
+        n = _num_examples_from_npz(f)
         counts[cid] = n
     return counts
 

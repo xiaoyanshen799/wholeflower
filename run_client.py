@@ -4,8 +4,11 @@ import pathlib
 import numpy as np
 import flwr as fl
 import logging
+from pathlib import Path
+import tensorflow as tf
 
 from fedavgm.client import FlowerClient
+from fedavgm.dataset import load_stackoverflow_meta, remap_shakespeare, remap_stackoverflow_labels
 
 # --- add: gRPC keepalive monkey patch (client) ---
 import grpc
@@ -38,8 +41,56 @@ def _load_partition(data_dir: pathlib.Path, cid: int) -> tuple[np.ndarray, np.nd
     file = data_dir / f"client_{cid:0{pad}d}.npz"
     if not file.exists():
         raise FileNotFoundError(f"Partition file not found: {file}")
-    with np.load(file) as npz:
+    with np.load(file, allow_pickle=True) as npz:
+        if "files" in npz and "labels" in npz:
+            return npz["files"], npz["labels"]
         return npz["x_train"], npz["y_train"]
+
+
+def _load_label_map(data_dir: Path) -> list[str]:
+    path = data_dir / "label_map.txt"
+    if not path.exists():
+        raise FileNotFoundError(f"Label map not found: {path}")
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _speech_log_mel(path: tf.Tensor, label: tf.Tensor, sample_rate: int = 16000, mel_bins: int = 64):
+    audio = tf.io.read_file(path)
+    wav, _ = tf.audio.decode_wav(audio, desired_channels=1)
+    wav = tf.squeeze(wav, axis=-1)
+    wav = tf.cast(wav, tf.float32)
+    desired = sample_rate
+    wav_len = tf.shape(wav)[0]
+    wav = tf.cond(
+        wav_len < desired,
+        lambda: tf.pad(wav, [[0, desired - wav_len]]),
+        lambda: wav[:desired],
+    )
+    stft = tf.signal.stft(wav, frame_length=256, frame_step=128, fft_length=256)
+    spec = tf.abs(stft)
+    mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=mel_bins,
+        num_spectrogram_bins=spec.shape[-1],
+        sample_rate=sample_rate,
+        lower_edge_hertz=80.0,
+        upper_edge_hertz=7600.0,
+    )
+    mel = tf.tensordot(tf.square(spec), mel_matrix, 1)
+    log_mel = tf.math.log(mel + 1e-6)
+    log_mel = tf.expand_dims(log_mel, -1)
+    return log_mel, label
+
+
+def _build_speech_ds(files, labels, data_root: Path, batch_size: int, training: bool) -> tf.data.Dataset:
+    file_paths = tf.constant([str(data_root / Path(f)) for f in files])
+    labels = tf.constant(labels, dtype=tf.int64)
+    ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
+    if training:
+        ds = ds.shuffle(len(files))
+    ds = ds.map(_speech_log_mel, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
 
 def main() -> None:
@@ -47,8 +98,29 @@ def main() -> None:
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0-indexed)")
     parser.add_argument("--server", help="Server address host:port")
     parser.add_argument("--data-dir", default="data_partitions", help="Directory containing partition files")
+    parser.add_argument(
+        "--dataset",
+        default="cifar10",
+        choices=["cifar10", "fmnist", "mnist", "femnist", "shakespeare", "speech_commands", "stackoverflow"],
+        help="Dataset name (controls preprocessing/model defaults)",
+    )
     parser.add_argument("--num-classes", type=int, default=10, help="Total number of classes in dataset")
-    parser.add_argument("--model", default="resnet20", choices=["cnn", "tf_example", "resnet20"], help="Model architecture")
+    parser.add_argument(
+        "--model",
+        default="resnet20",
+        choices=[
+            "cnn",
+            "tf_example",
+            "resnet20",
+            "char_lstm2",
+            "speech_cnn_small",
+            "embed_avg_mlp",
+            "embed_bilstm_mlp",
+            "embed_avg_mlp_bce",
+            "embed_bilstm_mlp_bce",
+        ],
+        help="Model architecture",
+    )
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for local model")
     parser.add_argument("--epochs", type=int, default=1, help="Local epochs per round (overrides server config if desired)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for local training")
@@ -69,27 +141,101 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+    # Resolve data directory (accept relative path or femnist/<path> fallback)
     data_dir = pathlib.Path(args.data_dir)
+    if not data_dir.exists():
+        candidate = pathlib.Path(__file__).resolve().parent / args.data_dir
+        if candidate.exists():
+            data_dir = candidate
+        else:
+            candidate = pathlib.Path(__file__).resolve().parent / "femnist" / args.data_dir
+            if candidate.exists():
+                data_dir = candidate
     x_full, y_full = _load_partition(data_dir, args.cid)
-    # Normalize to [0,1] to match server-side preprocessing
-    if x_full.dtype != np.float32:
-        x_full = x_full.astype(np.float32)
-    if x_full.max() > 1.0:
-        x_full /= 255.0
 
-    # 90-10 split into train / validation (same rule as baseline)
-    split_idx = int(0.9 * len(x_full))
-    x_train, y_train = x_full[:split_idx], y_full[:split_idx]
-    x_val, y_val = x_full[split_idx:], y_full[split_idx:]
+    dataset_name = args.dataset.lower()
+    train_ds_fn = None
+    val_ds_fn = None
+    train_size = None
+    val_size = None
+    use_sparse_labels = None
 
-    num_classes = args.num_classes
-    input_shape = list(x_full.shape[1:])
+    if dataset_name == "shakespeare":
+        x_full, vocab_size = remap_shakespeare(x_full, str(data_dir))
+        y_full, _ = remap_shakespeare(y_full, str(data_dir))
+        split_idx = int(0.9 * len(x_full))
+        x_train, y_train = x_full[:split_idx], y_full[:split_idx]
+        x_val, y_val = x_full[split_idx:], y_full[split_idx:]
+        num_classes = vocab_size
+        input_shape = [x_full.shape[1]]
+        use_sparse_labels = True
+    elif dataset_name == "speech_commands":
+        label_map = _load_label_map(Path(args.data_dir))
+        num_classes = len(label_map)
+        files = np.asarray(x_full)
+        labels = np.asarray(y_full, dtype=np.int64)
+        split_idx = int(0.9 * len(files))
+        train_files, val_files = files[:split_idx], files[split_idx:]
+        train_labels, val_labels = labels[:split_idx], labels[split_idx:]
+        train_size = len(train_files)
+        val_size = len(val_files)
+
+        def _train_fn(batch_size, training=True):
+            return _build_speech_ds(train_files, train_labels, data_dir, batch_size, training)
+
+        def _val_fn(batch_size, training=False):
+            return _build_speech_ds(val_files, val_labels, data_dir, batch_size, training)
+
+        train_ds_fn = _train_fn
+        val_ds_fn = _val_fn
+        sample_path = data_dir / Path(train_files[0])
+        sample_spec, _ = _speech_log_mel(tf.constant(str(sample_path)), tf.constant(0))
+        input_shape = list(sample_spec.shape)
+        use_sparse_labels = True
+        x_train = np.empty((0,), dtype=object)
+        y_train = np.empty((0,), dtype=np.int64)
+        x_val = np.empty((0,), dtype=object)
+        y_val = np.empty((0,), dtype=np.int64)
+    elif dataset_name == "stackoverflow":
+        meta = load_stackoverflow_meta(data_dir)
+        if getattr(y_full, "ndim", 1) == 2:
+            y_full = y_full.astype(np.float32, copy=False)
+            num_classes = int(y_full.shape[1])
+            use_sparse_labels = True
+        else:
+            y_full, num_classes = remap_stackoverflow_labels(y_full, meta.get("tag_vocab_size", 0))
+            use_sparse_labels = True
+        split_idx = int(0.9 * len(x_full))
+        x_train, y_train = x_full[:split_idx].astype(np.int32, copy=False), y_full[:split_idx]
+        x_val, y_val = x_full[split_idx:].astype(np.int32, copy=False), y_full[split_idx:]
+        input_shape = [int(x_full.shape[1])]
+    else:
+        # Image-style datasets
+        if x_full.dtype != np.float32:
+            x_full = x_full.astype(np.float32)
+        if x_full.max() > 1.0:
+            x_full /= 255.0
+        if x_full.ndim == 3:
+            x_full = np.expand_dims(x_full, axis=-1)
+
+        split_idx = int(0.9 * len(x_full))
+        x_train, y_train = x_full[:split_idx], y_full[:split_idx]
+        x_val, y_val = x_full[split_idx:], y_full[split_idx:]
+
+        num_classes = args.num_classes
+        input_shape = list(x_full.shape[1:])
 
     # Build Hydra-style config dict for FlowerClient
     target_map = {
         "cnn": "fedavgm.models.cnn",
         "tf_example": "fedavgm.models.tf_example",
         "resnet20": "fedavgm.models.resnet20_keras",
+        "char_lstm2": "fedavgm.models.char_lstm2",
+        "speech_cnn_small": "fedavgm.models.speech_cnn_small",
+        "embed_avg_mlp": "fedavgm.models.embed_avg_mlp",
+        "embed_bilstm_mlp": "fedavgm.models.embed_bilstm_mlp",
+        "embed_avg_mlp_bce": "fedavgm.models.embed_avg_mlp_bce",
+        "embed_bilstm_mlp_bce": "fedavgm.models.embed_bilstm_mlp_bce",
     }
 
     model_cfg = {
@@ -98,8 +244,45 @@ def main() -> None:
         "num_classes": int(num_classes),
         "learning_rate": args.lr,
     }
+    if dataset_name == "stackoverflow":
+        if args.model not in {
+            "embed_avg_mlp",
+            "embed_bilstm_mlp",
+            "embed_avg_mlp_bce",
+            "embed_bilstm_mlp_bce",
+        }:
+            raise SystemExit(
+                "For --dataset stackoverflow, please use --model "
+                "embed_avg_mlp/embed_bilstm_mlp (single-label) or "
+                "embed_avg_mlp_bce/embed_bilstm_mlp_bce (multi-label)"
+            )
+        is_multilabel = getattr(y_full, "ndim", 1) == 2
+        if is_multilabel and not args.model.endswith("_bce"):
+            raise SystemExit(
+                "This StackOverflow partition looks multi-label (y is 2-D). "
+                "Please use --model embed_avg_mlp_bce or embed_bilstm_mlp_bce."
+            )
+        if (not is_multilabel) and args.model.endswith("_bce"):
+            raise SystemExit(
+                "This StackOverflow partition looks single-label (y is 1-D). "
+                "Please use --model embed_avg_mlp or embed_bilstm_mlp."
+            )
+        meta = load_stackoverflow_meta(data_dir)
+        model_cfg["vocab_size"] = int(meta["vocab_size_total"])
 
-    client = FlowerClient(x_train, y_train, x_val, y_val, model_cfg, num_classes)
+    client = FlowerClient(
+        x_train,
+        y_train,
+        x_val,
+        y_val,
+        model_cfg,
+        num_classes,
+        train_dataset_fn=train_ds_fn,
+        val_dataset_fn=val_ds_fn,
+        train_size=train_size,
+        val_size=val_size,
+        use_sparse_labels=use_sparse_labels,
+    )
 
     if args.local_only:
         rounds = max(1, args.local_rounds)

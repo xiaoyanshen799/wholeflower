@@ -10,6 +10,10 @@ set -euo pipefail
 DATA_DIR=${1:-data_partitions}
 SERVER=${2:-"127.0.0.1:8081"}
 MAX_CLIENTS=${3:-0}   # 0 = 启动目录里所有 client_*.npz
+DATASET=${DATASET:-cifar10}
+MODEL=${MODEL:-cifar10_resnet}
+BATCH_SIZE=${BATCH_SIZE:-32}
+LR=${LR:-0.001}
 
 PY=${PY:-python3}
 
@@ -49,6 +53,7 @@ echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
 echo "CPU affinity: disabled"
+echo "LR          : $LR"
 echo
 
 shopt -s nullglob
@@ -119,8 +124,10 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
     --cid "$cid"
     --server "$SERVER"
     --data-dir "$DATA_DIR_ABS"
-    --model cnn
-    --num-classes 10
+    --dataset "$DATASET"
+    --model "$MODEL"
+    --lr "$LR"
+    --batch-size "$BATCH_SIZE"
     --uplink-num-bits 0
   )
 
@@ -130,7 +137,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
   cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
   "${SYSTEMD_RUN[@]}" \
-    -p CPUAccounting=yes -p CPUQuota="$cpu_quota" -p CPUQuotaPeriodSec=200ms \
+    -p CPUAccounting=yes -p CPUQuota="30%" -p CPUQuotaPeriodSec=20ms \
     --uid="$RUN_AS_USER" \
     --working-directory="$PROJECT_DIR" \
     "${ENV_VARS[@]}" \

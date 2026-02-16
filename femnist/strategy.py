@@ -165,13 +165,12 @@ class QuantizedFedAvgM(FedAvg):
             w_curr - w_avg for w_curr, w_avg in zip(current_weights, fedavg_result)
         ]
 
-        if server_round > 1:
-            assert self.momentum_vector is not None
+        if self.momentum_vector is None or len(self.momentum_vector) != len(pseudo_gradient):
+            self.momentum_vector = list(pseudo_gradient)
+        else:
             self.momentum_vector = [
                 self.server_momentum * m_prev + g for m_prev, g in zip(self.momentum_vector, pseudo_gradient)
             ]
-        else:
-            self.momentum_vector = list(pseudo_gradient)
 
         momentum_step = self.momentum_vector
 

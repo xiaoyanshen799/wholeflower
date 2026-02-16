@@ -40,7 +40,7 @@ def _resnet_layer(
 
 
 def _resnet_layer(
-    x,
+    inputs,
     num_filters: int,
     kernel_size: int = 3,
     strides: int = 1,
@@ -55,7 +55,7 @@ def _resnet_layer(
         padding="same",
         use_bias=False,
         kernel_initializer="he_normal",
-    )(x)
+    )(inputs)
     if batch_normalization:
         x = layers.BatchNormalization()(x)
     if activation is not None:
@@ -173,7 +173,7 @@ def resnet20_keras(input_shape, num_classes, learning_rate):
 
     optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
     model.compile(
-        loss="categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
+        loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
     )
 
     return model
@@ -226,7 +226,59 @@ def resnet18_keras(input_shape, num_classes, learning_rate):
     model = keras.Model(inputs=inputs, outputs=outputs)
 
     optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
-    model.compile(loss="categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
+    model.compile(loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
+
+    return model
+
+
+def resnet34_keras(input_shape, num_classes, learning_rate):
+    """Keras ResNet-34 adapted for CIFAR/MNIST-style inputs.
+
+    Four stages with blocks [3,4,6,3] and filters [64,128,256,512].
+    Downsampling at the first block of stages 2-4.
+    """
+
+    inputs = keras.Input(shape=input_shape)
+
+    # Initial conv
+    x = _resnet_layer(inputs=inputs, num_filters=64)
+
+    stages = [
+        (3, 64),
+        (4, 128),
+        (6, 256),
+        (3, 512),
+    ]
+
+    for si, (num_blocks, num_filters) in enumerate(stages):
+        for bi in range(num_blocks):
+            strides = 1
+            if si > 0 and bi == 0:
+                strides = 2
+
+            y = _resnet_layer(inputs=x, num_filters=num_filters, strides=strides)
+            y = _resnet_layer(inputs=y, num_filters=num_filters, activation=None)
+
+            if si > 0 and bi == 0:
+                x = _resnet_layer(
+                    inputs=x,
+                    num_filters=num_filters,
+                    kernel_size=1,
+                    strides=strides,
+                    activation=None,
+                    batch_normalization=False,
+                )
+
+            x = keras.layers.add([x, y])
+            x = keras.layers.Activation("relu")(x)
+
+    x = keras.layers.GlobalAveragePooling2D()(x)
+    outputs = keras.layers.Dense(num_classes, activation="softmax", kernel_initializer="he_normal")(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs)
+
+    optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
+    model.compile(loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
 
     return model
 

@@ -1,5 +1,8 @@
 import argparse
 import pathlib
+import os
+
+os.environ.setdefault("FLWR_TELEMETRY_ENABLED", "0")
 
 import flwr as fl
 import logging
@@ -11,6 +14,16 @@ from pathlib import Path
 # actual compute instead of thread-pool throttling on constrained devices.
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
+
+
+def _configure_tf_gpu_memory_growth() -> None:
+    """Enable on-demand GPU memory allocation for TensorFlow."""
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            logging.warning("Failed to enable memory growth for %s: %s", gpu, exc)
 
 from client import FlowerClient
 from fedavgm.dataset import load_stackoverflow_meta, remap_shakespeare, remap_stackoverflow_labels
@@ -100,6 +113,7 @@ def _build_speech_ds(files, labels, data_root: Path, batch_size: int, training: 
 
 
 def main() -> None:
+    _configure_tf_gpu_memory_growth()
     parser = argparse.ArgumentParser(description="Run Flower client.")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0-indexed)")
     parser.add_argument("--server", help="Server address host:port")
@@ -118,6 +132,7 @@ def main() -> None:
             "cnn",
             "tf_example",
             "resnet18",
+            "resnet34",
             "resnet20",
             "cifar10_resnet",
             "mobilenet_v2_075",
@@ -284,6 +299,7 @@ def main() -> None:
         "cnn": "fedavgm.models.cnn",
         "tf_example": "fedavgm.models.tf_example",
         "resnet18": "fedavgm.models.resnet18_keras",
+        "resnet34": "fedavgm.models.resnet34_keras",
         "resnet20": "fedavgm.models.resnet20_keras",
         "cifar10_resnet": "fedavgm.models.cifar10_resnet",
         "mobilenet_v2_075": "fedavgm.models.mobilenet_v2_075",

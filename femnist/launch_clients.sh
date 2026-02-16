@@ -9,13 +9,25 @@ set -euo pipefail
 
 DATA_DIR=${1:-data_partitions}
 SERVER=${2:-"127.0.0.1:8081"}
-MAX_CLIENTS=${3:-0}   # 0 = 启动目录里所有 client_*.npz
-DATASET=${DATASET:-cifar10}
-MODEL=${MODEL:-cifar10_resnet}
-BATCH_SIZE=${BATCH_SIZE:-32}
+MAX_CLIENTS=${3:-4}   # 默认仅启动前 4 个；设为 0 启动目录里所有 client_*.npz
+DATASET=${DATASET:-speech_commands}
+MODEL=${MODEL:-resnet34}
+BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-0.001}
 
 PY=${PY:-python3}
+# Accept common wrappers like "( python3 )" and optional args like "python3 -u".
+PY=$(echo "$PY" | sed -E 's/^[[:space:]]*\((.*)\)[[:space:]]*$/\1/' | xargs)
+read -r -a PY_CMD <<< "$PY"
+if [[ ${#PY_CMD[@]} -eq 0 ]]; then
+  echo "Invalid PY setting: empty value"
+  exit 1
+fi
+if ! command -v "${PY_CMD[0]}" >/dev/null 2>&1; then
+  echo "Invalid PY setting: '${PY_CMD[0]}' not found in PATH"
+  echo "Example: PY=/home/xiaoyan/wholeflower/fedavgm/venv/bin/python ./launch_clients.sh ..."
+  exit 1
+fi
 
 # 运行哪个用户（默认当前用户）；之前写死 ubuntu 会导致 217/USER，客户端根本没起来
 RUN_AS_USER=${RUN_AS_USER:-"$(id -un)"}
@@ -47,8 +59,8 @@ ENV_VARS=(
 
 echo "Data dir    : $DATA_DIR_ABS"
 echo "Server      : $SERVER"
-echo "Max clients : ${MAX_CLIENTS:-all}"
-echo "Python      : $PY"
+echo "Max clients : ${MAX_CLIENTS}"
+echo "Python      : ${PY_CMD[*]}"
 echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
@@ -120,7 +132,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cleanup_unit "$unit_name"
 
   client_cmd=(
-    "$PY" "$PROJECT_DIR/run_client.py"
+    "${PY_CMD[@]}" "$PROJECT_DIR/run_client.py"
     --cid "$cid"
     --server "$SERVER"
     --data-dir "$DATA_DIR_ABS"
@@ -137,7 +149,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
   cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
   "${SYSTEMD_RUN[@]}" \
-    -p CPUAccounting=yes -p CPUQuota="30%" -p CPUQuotaPeriodSec=20ms \
+    -p CPUAccounting=yes -p CPUQuota="100%" -p CPUQuotaPeriodSec=20ms \
     --uid="$RUN_AS_USER" \
     --working-directory="$PROJECT_DIR" \
     "${ENV_VARS[@]}" \

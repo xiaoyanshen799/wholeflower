@@ -1,13 +1,17 @@
 import argparse
 from datetime import datetime
 import logging
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
+os.environ.setdefault("FLWR_TELEMETRY_ENABLED", "0")
+
 import flwr as fl
 from omegaconf import OmegaConf
+import tensorflow as tf
 
 from fedavgm.dataset import (
     cifar10,
@@ -25,6 +29,7 @@ from fedavgm.models import (
     mobilenet_v2_075,
     mobilenet_v2_100,
     resnet18_keras,
+    resnet34_keras,
     resnet20_keras,
     cifar10_resnet,
     tf_example,
@@ -59,6 +64,16 @@ def _srv(executor=None, options=None, *a, **k):
     return _real_srv(executor, options=opts + SRV_OPTS, *a, **k)
 
 grpc.server = _srv
+
+
+def _configure_tf_gpu_memory_growth() -> None:
+    """Enable on-demand GPU memory allocation for TensorFlow."""
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            logging.warning("Failed to enable memory growth for %s: %s", gpu, exc)
 
 
 def _resolve_path(candidates):
@@ -122,6 +137,7 @@ def _load_dataset(name: str, *, shakespeare_dir=None, speech_dir=None, stackover
 
 
 def main() -> None:
+    _configure_tf_gpu_memory_growth()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -158,6 +174,7 @@ def main() -> None:
             "cnn",
             "tf_example",
             "resnet18",
+            "resnet34",
             "resnet20",
             "cifar10_resnet",
             "mobilenet_v2_075",
@@ -371,6 +388,7 @@ def main() -> None:
         "cnn": cnn,
         "tf_example": tf_example,
         "resnet18": resnet18_keras,
+        "resnet34": resnet34_keras,
         "resnet20": resnet20_keras,
         "cifar10_resnet": cifar10_resnet,
         "mobilenet_v2_075": mobilenet_v2_075,

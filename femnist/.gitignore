@@ -27,3 +27,8 @@ logs/
 # OS specific
 .DS_Store
 Thumbs.db 
+
+femnist/data
+femnist/data_partitions_speech_commands/raw
+venv_ixia/
+venv_ixi/

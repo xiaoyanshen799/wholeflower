@@ -14,6 +14,10 @@ DATASET=${DATASET:-speech_commands}
 MODEL=${MODEL:-resnet34}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-0.001}
+MPS_ENABLE=${MPS_ENABLE:-1}
+MPS_PERCENT=${MPS_PERCENT:-5}
+MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
+MPS_LOG_DIRECTORY=${MPS_LOG_DIRECTORY:-/tmp/nvidia-mps}
 
 PY=${PY:-python3}
 # Accept common wrappers like "( python3 )" and optional args like "python3 -u".
@@ -55,6 +59,9 @@ ENV_VARS=(
   --setenv=NUMEXPR_NUM_THREADS=1
   --setenv=TF_NUM_INTRAOP_THREADS=1
   --setenv=TF_NUM_INTEROP_THREADS=1
+  --setenv=CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_PERCENT"
+  --setenv=CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE_DIRECTORY"
+  --setenv=CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY"
 )
 
 echo "Data dir    : $DATA_DIR_ABS"
@@ -66,6 +73,10 @@ echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
 echo "CPU affinity: disabled"
 echo "LR          : $LR"
+echo "MPS enable  : $MPS_ENABLE"
+echo "MPS percent : $MPS_PERCENT"
+echo "MPS pipe dir: $MPS_PIPE_DIRECTORY"
+echo "MPS log dir : $MPS_LOG_DIRECTORY"
 echo
 
 shopt -s nullglob
@@ -83,6 +94,52 @@ fi
 # 运行完成（包括失败）后自动卸载 transient unit，避免下次 --unit 同名冲突
 # --no-block: 不阻塞当前 shell，允许循环继续启动下一个 client
 SYSTEMD_RUN+=(--collect --scope --no-block)
+
+ensure_mps_daemon() {
+  if [[ "$MPS_ENABLE" != "1" ]]; then
+    echo "MPS disabled by MPS_ENABLE=$MPS_ENABLE"
+    return 0
+  fi
+
+  if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    echo "ERROR: nvidia-cuda-mps-control not found in PATH."
+    echo "Install CUDA MPS tools or set MPS_ENABLE=0 to skip MPS."
+    exit 1
+  fi
+
+  mkdir -p "$MPS_PIPE_DIRECTORY" "$MPS_LOG_DIRECTORY"
+
+  if pgrep -u "$RUN_AS_USER" -f nvidia-cuda-mps-control >/dev/null 2>&1 || \
+     pgrep -u "$RUN_AS_USER" -f nvidia-cuda-mps-server >/dev/null 2>&1; then
+    echo "MPS daemon already running for user $RUN_AS_USER"
+    return 0
+  fi
+
+  echo "Starting MPS daemon for user $RUN_AS_USER ..."
+  if [[ "$(id -un)" == "$RUN_AS_USER" ]]; then
+    CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE_DIRECTORY" \
+    CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY" \
+      nvidia-cuda-mps-control -d
+  else
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "ERROR: current user is $(id -un), target RUN_AS_USER is $RUN_AS_USER, but sudo is unavailable."
+      exit 1
+    fi
+    sudo -u "$RUN_AS_USER" \
+      CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE_DIRECTORY" \
+      CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY" \
+      nvidia-cuda-mps-control -d
+  fi
+
+  sleep 0.2
+  if pgrep -u "$RUN_AS_USER" -f nvidia-cuda-mps-control >/dev/null 2>&1 || \
+     pgrep -u "$RUN_AS_USER" -f nvidia-cuda-mps-server >/dev/null 2>&1; then
+    echo "MPS daemon started."
+  else
+    echo "ERROR: failed to start MPS daemon for user $RUN_AS_USER"
+    exit 1
+  fi
+}
 
 cleanup_unit() {
   local unit="$1"
@@ -103,6 +160,8 @@ cleanup_unit() {
     done
   fi
 }
+
+ensure_mps_daemon
 
 count=0
 launch_pids=()

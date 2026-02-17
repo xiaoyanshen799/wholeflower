@@ -164,7 +164,7 @@ def main() -> None:
         help="Aggregation strategy",
     )
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
-    parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
+    parser.add_argument("--clients", type=int, default=3, help="Expected total number of clients")
     parser.add_argument("--reporting-fraction", type=float, default=1.0, help="Fraction of clients selected per round")
     parser.add_argument("--server-lr", type=float, default=0.01, help="Server learning rate (FedAvgM)")
     parser.add_argument(

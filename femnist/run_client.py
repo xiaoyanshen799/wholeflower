@@ -18,6 +18,11 @@ tf.config.threading.set_inter_op_parallelism_threads(1)
 
 def _configure_tf_gpu_memory_growth() -> None:
     """Enable on-demand GPU memory allocation for TensorFlow."""
+    # On some container/runtime stacks (e.g. K3s + HAMi), probing GPU devices
+    # can block indefinitely. Allow skipping this step via env var.
+    if os.environ.get("SKIP_TF_GPU_MEMORY_GROWTH", "0") == "1":
+        logging.info("Skipping TensorFlow GPU memory-growth probe")
+        return
     gpus = tf.config.list_physical_devices("GPU")
     for gpu in gpus:
         try:
@@ -254,10 +259,9 @@ def main() -> None:
 
         train_ds_fn = _train_fn
         val_ds_fn = _val_fn
-        # Infer input shape from a single example
-        sample_path = data_dir / Path(train_files[0])
-        sample_spec, _ = _speech_log_mel(tf.constant(str(sample_path)), tf.constant(0))
-        input_shape = list(sample_spec.shape)
+        # Keep input shape aligned with server-side speech_commands defaults.
+        # Avoid probing a sample at startup (can block on some runtime stacks).
+        input_shape = [98, 64, 1]
         use_sparse_labels = True
         # Placeholders for legacy array interface (unused when dataset fns provided)
         x_train = np.empty((0,), dtype=object)

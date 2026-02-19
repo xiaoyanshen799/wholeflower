@@ -7,13 +7,15 @@ set -euo pipefail
 # 例子：
 #   PY=$(which python3) ./launch_clients.sh data_partitions 172.31.17.220:8081 42
 
-DATA_DIR=${1:-data_partitions}
+DATA_DIR=${1:-data_partitions_speech_commands}
 SERVER=${2:-"127.0.0.1:8081"}
 MAX_CLIENTS=${3:-4}   # 默认仅启动前 4 个；设为 0 启动目录里所有 client_*.npz
 DATASET=${DATASET:-speech_commands}
 MODEL=${MODEL:-resnet34}
-BATCH_SIZE=${BATCH_SIZE:-8}
-LR=${LR:-0.001}
+BATCH_SIZE=${BATCH_SIZE:-20}
+LR=${LR:-0.01}
+CLIENT_ENTRY=${CLIENT_ENTRY:-run_client_torch.py}
+CLIENT_CUDA_VISIBLE_DEVICES=${CLIENT_CUDA_VISIBLE_DEVICES:-__UNSET__}
 MPS_ENABLE=${MPS_ENABLE:-1}
 MPS_PERCENT=${MPS_PERCENT:-5}
 MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
@@ -59,9 +61,6 @@ ENV_VARS=(
   --setenv=NUMEXPR_NUM_THREADS=1
   --setenv=TF_NUM_INTRAOP_THREADS=1
   --setenv=TF_NUM_INTEROP_THREADS=1
-  --setenv=CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_PERCENT"
-  --setenv=CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE_DIRECTORY"
-  --setenv=CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY"
 )
 
 echo "Data dir    : $DATA_DIR_ABS"
@@ -73,6 +72,12 @@ echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
 echo "CPU affinity: disabled"
 echo "LR          : $LR"
+echo "Client entry: $CLIENT_ENTRY"
+if [[ "$CLIENT_CUDA_VISIBLE_DEVICES" == "__UNSET__" ]]; then
+  echo "Client CUDA_VISIBLE_DEVICES: <inherit default>"
+else
+  echo "Client CUDA_VISIBLE_DEVICES: ${CLIENT_CUDA_VISIBLE_DEVICES:-<empty>}"
+fi
 echo "MPS enable  : $MPS_ENABLE"
 echo "MPS percent : $MPS_PERCENT"
 echo "MPS pipe dir: $MPS_PIPE_DIRECTORY"
@@ -191,7 +196,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cleanup_unit "$unit_name"
 
   client_cmd=(
-    "${PY_CMD[@]}" "$PROJECT_DIR/run_client.py"
+    "${PY_CMD[@]}" "$PROJECT_DIR/$CLIENT_ENTRY"
     --cid "$cid"
     --server "$SERVER"
     --data-dir "$DATA_DIR_ABS"
@@ -204,6 +209,15 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
 
   cmd_str="$(printf '%q ' "${client_cmd[@]}")"
   log_q="$(printf '%q' "$log_file")"
+  mps_percent_q="$(printf '%q' "$MPS_PERCENT")"
+  mps_pipe_q="$(printf '%q' "$MPS_PIPE_DIRECTORY")"
+  mps_log_q="$(printf '%q' "$MPS_LOG_DIRECTORY")"
+  cuda_export=""
+  if [[ "$CLIENT_CUDA_VISIBLE_DEVICES" != "__UNSET__" ]]; then
+    cuda_visible_q="$(printf '%q' "$CLIENT_CUDA_VISIBLE_DEVICES")"
+    cuda_export="export CUDA_VISIBLE_DEVICES=${cuda_visible_q}; "
+  fi
+  launch_script="export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${mps_percent_q}; export CUDA_MPS_PIPE_DIRECTORY=${mps_pipe_q}; export CUDA_MPS_LOG_DIRECTORY=${mps_log_q}; ${cuda_export}${cmd_str} >> ${log_q} 2>&1"
 
   cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
   cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
@@ -213,7 +227,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
     --working-directory="$PROJECT_DIR" \
     "${ENV_VARS[@]}" \
     --unit="$unit" \
-    /bin/bash -lc "${cmd_str} >> ${log_q} 2>&1" &
+    /bin/bash -lc "${launch_script}" &
   launch_pids+=("$!")
 
   # 如果 unit 立即失败，直接给出原因（常见：用户/环境/模块路径）

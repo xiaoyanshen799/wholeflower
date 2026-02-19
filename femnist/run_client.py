@@ -78,7 +78,15 @@ def _load_label_map(data_dir: Path) -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _speech_log_mel(path: tf.Tensor, label: tf.Tensor, sample_rate: int = 16000, mel_bins: int = 64):
+def _speech_log_mel(
+    path: tf.Tensor,
+    label: tf.Tensor,
+    sample_rate: int = 16000,
+    mel_bins: int = 32,
+    frame_length: int = 400,
+    frame_step: int = 160,
+    fft_length: int = 512,
+):
     audio = tf.io.read_file(path)
     wav, _ = tf.audio.decode_wav(audio, desired_channels=1)
     wav = tf.squeeze(wav, axis=-1)
@@ -90,7 +98,12 @@ def _speech_log_mel(path: tf.Tensor, label: tf.Tensor, sample_rate: int = 16000,
         lambda: tf.pad(wav, [[0, desired - wav_len]]),
         lambda: wav[:desired],
     )
-    stft = tf.signal.stft(wav, frame_length=256, frame_step=128, fft_length=256)
+    stft = tf.signal.stft(
+        wav,
+        frame_length=frame_length,
+        frame_step=frame_step,
+        fft_length=fft_length,
+    )
     spec = tf.abs(stft)
     mel_matrix = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=mel_bins,
@@ -101,6 +114,10 @@ def _speech_log_mel(path: tf.Tensor, label: tf.Tensor, sample_rate: int = 16000,
     )
     mel = tf.tensordot(tf.square(spec), mel_matrix, 1)
     log_mel = tf.math.log(mel + 1e-6)
+    # Per-example CMVN, common for speech command classification.
+    mean = tf.reduce_mean(log_mel)
+    std = tf.math.reduce_std(log_mel)
+    log_mel = (log_mel - mean) / (std + 1e-6)
     log_mel = tf.expand_dims(log_mel, -1)
     return log_mel, label
 
@@ -261,7 +278,7 @@ def main() -> None:
         val_ds_fn = _val_fn
         # Keep input shape aligned with server-side speech_commands defaults.
         # Avoid probing a sample at startup (can block on some runtime stacks).
-        input_shape = [98, 64, 1]
+        input_shape = [98, 32, 1]
         use_sparse_labels = True
         # Placeholders for legacy array interface (unused when dataset fns provided)
         x_train = np.empty((0,), dtype=object)

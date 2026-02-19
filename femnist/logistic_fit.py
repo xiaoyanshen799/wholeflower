@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/ubuntu/wholeflower/femnist/logs/stackoverflow_60.csv"
+csv_file = "/home/xiaoyan/wholeflower/femnist/logs/comm_times_tf_aligned_30.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -343,7 +343,7 @@ if all_durations:
     # ------------------------------------------------------------------
     # 4)  Plot
     # ------------------------------------------------------------------
-    plt.plot(t_grid, prod_original, label="product of original logistic fits", lw=2, color='black')
+    # plt.plot(t_grid, prod_original, label="product of original logistic fits", lw=2, color='black')
     # plt.plot(t_grid, prod_gamma, "-", label=f"product with k={K_FIXED}, γ-fitted", lw=2, color='red')
     # plt.plot(t_grid, prod_t, "-", label="product of t fits", lw=2, color='green')
     # plt.plot(t_grid, prod_weibull, "-", label="product of Weibull fits", lw=2, color='blue')

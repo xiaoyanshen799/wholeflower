@@ -41,7 +41,7 @@ from fedavgm.models import (
     embed_bilstm_mlp_bce,
 )
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
-from strategy import QuantizedFedAvgM
+from strategy import CSVFedAvg, QuantizedFedAvgM
 from baseline_selection import FedCSStrategy, TiFLStrategy
 import grpc
 from concurrent import futures
@@ -119,7 +119,7 @@ def _load_dataset(name: str, *, shakespeare_dir=None, speech_dir=None, stackover
         )
         if base is None:
             raise FileNotFoundError("Could not find Speech Commands partitions (try --data-dir-speech)")
-        return speech_commands(num_classes=12, input_shape=[98, 64, 1], data_dir=base)
+        return speech_commands(num_classes=12, input_shape=[98, 32, 1], data_dir=base)
     if name in {"stackoverflow", "stack_overflow", "stack-overflow"}:
         if stackoverflow_dir is not None and not Path(stackoverflow_dir).exists():
             raise FileNotFoundError(f"StackOverflow partitions not found: {Path(stackoverflow_dir)}")
@@ -159,7 +159,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--strategy",
-        default="custom-fedavgm",
+        default="fedavg",
         choices=["fedavg", "fedavgm", "custom-fedavgm", "fedcs", "tifl"],
         help="Aggregation strategy",
     )
@@ -468,9 +468,8 @@ def main() -> None:
     # Select strategy
     # ------------------------------------------------------------------
     if args.strategy == "fedavg":
-        from flwr.server.strategy import FedAvg
-
-        strategy = FedAvg(
+        strategy = CSVFedAvg(
+            csv_log_path=args.csv_path,
             fraction_fit=args.reporting_fraction,
             fraction_evaluate=0.0,
             min_available_clients=args.clients,

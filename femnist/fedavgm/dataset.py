@@ -300,7 +300,14 @@ def _load_label_map(data_dir: Path) -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _load_log_mel(path: Path, sample_rate: int = 16000, mel_bins: int = 64) -> np.ndarray:
+def _load_log_mel(
+    path: Path,
+    sample_rate: int = 16000,
+    mel_bins: int = 32,
+    frame_length: int = 400,
+    frame_step: int = 160,
+    fft_length: int = 512,
+) -> np.ndarray:
     """Return log-mel spectrogram for one audio file as a numpy array."""
     audio = tf.io.read_file(str(path))
     wav, sr = tf.audio.decode_wav(audio, desired_channels=1)
@@ -316,7 +323,12 @@ def _load_log_mel(path: Path, sample_rate: int = 16000, mel_bins: int = 64) -> n
         lambda: wav[:desired],
     )
 
-    stft = tf.signal.stft(wav, frame_length=256, frame_step=128, fft_length=256)
+    stft = tf.signal.stft(
+        wav,
+        frame_length=frame_length,
+        frame_step=frame_step,
+        fft_length=fft_length,
+    )
     spectrogram = tf.abs(stft)
     mel_matrix = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=mel_bins,
@@ -327,6 +339,10 @@ def _load_log_mel(path: Path, sample_rate: int = 16000, mel_bins: int = 64) -> n
     )
     mel_spectrogram = tf.tensordot(tf.square(spectrogram), mel_matrix, 1)
     log_mel = tf.math.log(mel_spectrogram + 1e-6)
+    # Per-example CMVN keeps train/eval preprocessing aligned.
+    mean = tf.reduce_mean(log_mel)
+    std = tf.math.reduce_std(log_mel)
+    log_mel = (log_mel - mean) / (std + 1e-6)
     log_mel = tf.expand_dims(log_mel, -1)
     return log_mel.numpy().astype(np.float32)
 
@@ -335,7 +351,7 @@ def speech_commands(
     num_classes,
     input_shape,
     data_dir: str = "data_partitions_speech_commands",
-    mel_bins: int = 64,
+    mel_bins: int = 32,
 ):
     """Load Speech Commands manifests and compute test log-mel features for evaluation."""
     base = Path(data_dir)

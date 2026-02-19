@@ -7,10 +7,10 @@ import matplotlib.cm as cm
 # -------------------------------------------------
 # 1) load data
 # -------------------------------------------------
-df = pd.read_csv("/home/ubuntu/wholeflower/femnist/mnist_cpu_theta.csv")
+df = pd.read_csv("/home/xiaoyan/wholeflower/femnist/mnist_cpu_theta.csv")
 
 # anchor rows that every client has
-anchor_cpu = np.array([1.0,0.6,0.3])
+anchor_cpu = np.array([5,10,20])
 
 # percentages a% in (0,1) to generate extra points at c = 1 * a
 # Use small interval (e.g., 5%) and theta1 = theta0 / a
@@ -19,7 +19,7 @@ a_values = np.arange(0.6, 1.0, 0.05)
 
 # power-law + constant model
 def power_shift(cpu, alpha, beta, gamma):
-    return alpha * cpu**-beta
+    return alpha * cpu**-beta + gamma
 
 print("client  θ:α      θ:β     θ:γ     cpu(θ=50)   k:α      k:β     k:γ     k@θ=50")
 print("------  -------  ------  ------  ----------  -------  ------  ------  --------")
@@ -108,7 +108,7 @@ for i, (cid, sub) in enumerate(df.groupby("id"), start=0):
     #     added_scaled_legend = True
 
 # plot cosmetics
-plt.xlabel("cpu_size")
+plt.xlabel("gpu usage percentage")
 plt.ylabel(r"$\theta$")
 plt.title("K * b + gamma")
 plt.grid(alpha=0.3)

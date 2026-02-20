@@ -4,39 +4,29 @@ from flwr.common import ndarrays_to_parameters
 from keras.optimizers import SGD
 from keras.regularizers import l2
 from tensorflow import keras
-from tensorflow.nn import local_response_normalization  
+from tensorflow.nn import local_response_normalization
 import tensorflow as tf
 from tensorflow.keras import layers
 
-# -----------------------------------------------------------------------------
-# Keras implementation for CIFAR-10 ResNet-20 (used by FlowerClient)
-# -----------------------------------------------------------------------------
 
-
-def _resnet_layer(
-    inputs,
-    num_filters=16,
-    kernel_size=3,
-    strides=1,
-    activation="relu",
-    batch_normalization=True,
-):
-    """2-D Convolution-BN(optional)-Activation layer builder"""
-    x = keras.layers.Conv2D(
-        num_filters,
-        kernel_size=kernel_size,
-        strides=strides,
-        padding="same",
-        kernel_initializer="he_normal",
-        use_bias=False,
-    )(inputs)
-    if batch_normalization:
-        x = keras.layers.BatchNormalization()(x)
-    if activation is not None:
-        x = keras.layers.Activation(activation)(x)
-    return x
-
-
+def _sgd_with_momentum_wd(
+    learning_rate: float,
+    *,
+    momentum: float = 0.9,
+    weight_decay: float = 5e-4,
+) -> keras.optimizers.Optimizer:
+    """Build SGD optimizer using decoupled weight decay when supported."""
+    try:
+        return keras.optimizers.SGD(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    except TypeError:
+        return keras.optimizers.SGD(
+            learning_rate=learning_rate,
+            momentum=momentum,
+        )
 
 
 def _resnet_layer(
@@ -46,8 +36,10 @@ def _resnet_layer(
     strides: int = 1,
     activation: str | None = "relu",
     batch_normalization: bool = True,
+    weight_decay: float | None = None,
 ):
     """Conv-BN-Act (CIFAR-style)."""
+    kernel_regularizer = l2(weight_decay) if weight_decay else None
     x = layers.Conv2D(
         num_filters,
         kernel_size=kernel_size,
@@ -55,6 +47,7 @@ def _resnet_layer(
         padding="same",
         use_bias=False,
         kernel_initializer="he_normal",
+        kernel_regularizer=kernel_regularizer,
     )(inputs)
     if batch_normalization:
         x = layers.BatchNormalization()(x)
@@ -62,12 +55,12 @@ def _resnet_layer(
         x = layers.Activation(activation)(x)
     return x
 
+
 def _basic_block(x, num_filters: int, strides: int):
     """CIFAR ResNet v1 basic block: (3x3)-(3x3) with identity/proj shortcut."""
     y = _resnet_layer(x, num_filters=num_filters, strides=strides, activation="relu")
     y = _resnet_layer(y, num_filters=num_filters, strides=1, activation=None)
 
-    # projection shortcut when shape changes
     if strides != 1 or x.shape[-1] != num_filters:
         shortcut = _resnet_layer(
             x,
@@ -84,36 +77,89 @@ def _basic_block(x, num_filters: int, strides: int):
     out = layers.Activation("relu")(out)
     return out
 
+
 def _make_cifar_resnet(inputs, depth: int):
-    """
-    CIFAR ResNet v1 depth = 6n + 2, n blocks per stage.
-    Common: 20(n=3), 32(n=5), 44(n=7), 56(n=9)
-    """
+    """CIFAR ResNet v1 with depth=6n+2."""
     if (depth - 2) % 6 != 0:
         raise ValueError("CIFAR ResNet v1 requires depth=6n+2, e.g., 20/32/44/56.")
 
-    n = (depth - 2) // 6  # blocks per stage
-
-    # CIFAR stem: 3x3, 16 filters, stride 1, no maxpool
+    n = (depth - 2) // 6
     x = _resnet_layer(inputs, num_filters=16, strides=1)
 
-    # 3 stages: 16, 32, 64
     for stage, num_filters in enumerate([16, 32, 64]):
         for block in range(n):
-            strides = 1
-            if stage > 0 and block == 0:
-                strides = 2
+            strides = 2 if (stage > 0 and block == 0) else 1
             x = _basic_block(x, num_filters=num_filters, strides=strides)
 
     x = layers.GlobalAveragePooling2D()(x)
     return x
 
+
+def _refl_block(x, num_filters: int, strides: int, weight_decay: float):
+    """REFL-style basic residual block (PyTorch-style CIFAR stem/stages)."""
+    y = _resnet_layer(
+        x,
+        num_filters=num_filters,
+        strides=strides,
+        activation="relu",
+        weight_decay=weight_decay,
+    )
+    y = _resnet_layer(
+        y,
+        num_filters=num_filters,
+        strides=1,
+        activation=None,
+        weight_decay=weight_decay,
+    )
+
+    if strides != 1 or x.shape[-1] != num_filters:
+        shortcut = _resnet_layer(
+            x,
+            num_filters=num_filters,
+            kernel_size=1,
+            strides=strides,
+            activation=None,
+            batch_normalization=True,
+            weight_decay=weight_decay,
+        )
+    else:
+        shortcut = x
+
+    out = layers.Add()([shortcut, y])
+    return layers.Activation("relu")(out)
+
+
+def resnet18_refl(input_shape, num_classes, learning_rate):
+    """REFL CIFAR10 model: small-input ResNet18-style (2,2,2 blocks)."""
+    weight_decay = 5e-4
+    inputs = keras.Input(shape=input_shape)
+    x = _resnet_layer(inputs, num_filters=16, strides=1, weight_decay=weight_decay)
+
+    for idx, filters in enumerate((16, 32, 64)):
+        for block in range(2):
+            strides = 2 if (idx > 0 and block == 0) else 1
+            x = _refl_block(x, num_filters=filters, strides=strides, weight_decay=weight_decay)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    outputs = layers.Dense(
+        int(num_classes),
+        activation="softmax",
+        kernel_initializer="he_normal",
+        kernel_regularizer=l2(weight_decay),
+    )(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="resnet18_refl_cifar")
+    optimizer = _sgd_with_momentum_wd(learning_rate=learning_rate, momentum=0.9, weight_decay=weight_decay)
+    model.compile(
+        optimizer=optimizer,
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
 def cifar10_resnet(input_shape, num_classes, learning_rate, depth: int = 32):
-    """
-    CIFAR-style ResNet v1.
-    - depth=32 (recommended middle ground)
-    - depth=20 (lighter)
-    """
+    """CIFAR-style ResNet v1 (depth=6n+2)."""
     inputs = keras.Input(shape=input_shape)
     x = _make_cifar_resnet(inputs, depth=depth)
     outputs = layers.Dense(
@@ -123,34 +169,25 @@ def cifar10_resnet(input_shape, num_classes, learning_rate, depth: int = 32):
     )(x)
 
     model = keras.Model(inputs, outputs, name=f"cifar_resnet{depth}_v1")
-
-    # Optimizer: SGD+momentum is the classic choice for CIFAR ResNet
-    opt = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9, nesterov=False, clipnorm=1.0)
-    model.compile(optimizer=opt, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    optimizer = _sgd_with_momentum_wd(learning_rate=learning_rate)
+    model.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return model
 
 
 def resnet20_keras(input_shape, num_classes, learning_rate):
     """Keras ResNet-20 v1 for CIFAR-10 (3×{3,3,3})."""
-
     inputs = keras.Input(shape=input_shape)
     num_filters = 16
-
-    # First conv
     x = _resnet_layer(inputs=inputs, num_filters=num_filters)
 
-    # Instantiate the stack of residual units
     for stack in range(3):
         for res_block in range(3):
-            strides = 1
-            if stack > 0 and res_block == 0:  # first layer but not first stack
-                strides = 2  # downsample
+            strides = 2 if (stack > 0 and res_block == 0) else 1
 
             y = _resnet_layer(inputs=x, num_filters=num_filters, strides=strides)
             y = _resnet_layer(inputs=y, num_filters=num_filters, activation=None)
 
             if stack > 0 and res_block == 0:
-                # Linear projection to match dims
                 x = _resnet_layer(
                     inputs=x,
                     num_filters=num_filters,
@@ -163,32 +200,20 @@ def resnet20_keras(input_shape, num_classes, learning_rate):
             x = keras.layers.add([x, y])
             x = keras.layers.Activation("relu")(x)
 
-        num_filters *= 2  # Double filters each stack
+        num_filters *= 2
 
-    # Final classification layer
     x = keras.layers.GlobalAveragePooling2D()(x)
     outputs = keras.layers.Dense(num_classes, activation="softmax", kernel_initializer="he_normal")(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs)
-
-    optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
-    model.compile(
-        loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
-    )
-
+    optimizer = _sgd_with_momentum_wd(learning_rate=learning_rate)
+    model.compile(loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
     return model
 
 
 def resnet18_keras(input_shape, num_classes, learning_rate):
-    """Keras ResNet-18 adapted for CIFAR/MNIST-style inputs.
-
-    Four stages with blocks [2,2,2,2] and filters [64,128,256,512].
-    Downsampling at the first block of stages 2-4.
-    """
-
+    """Keras ResNet-18 adapted for CIFAR/MNIST-style inputs."""
     inputs = keras.Input(shape=input_shape)
-
-    # Initial conv
     x = _resnet_layer(inputs=inputs, num_filters=64)
 
     stages = [
@@ -200,9 +225,7 @@ def resnet18_keras(input_shape, num_classes, learning_rate):
 
     for si, (num_blocks, num_filters) in enumerate(stages):
         for bi in range(num_blocks):
-            strides = 1
-            if si > 0 and bi == 0:
-                strides = 2
+            strides = 2 if (si > 0 and bi == 0) else 1
 
             y = _resnet_layer(inputs=x, num_filters=num_filters, strides=strides)
             y = _resnet_layer(inputs=y, num_filters=num_filters, activation=None)
@@ -224,23 +247,14 @@ def resnet18_keras(input_shape, num_classes, learning_rate):
     outputs = keras.layers.Dense(num_classes, activation="softmax", kernel_initializer="he_normal")(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs)
-
-    optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
+    optimizer = _sgd_with_momentum_wd(learning_rate=learning_rate)
     model.compile(loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
-
     return model
 
 
 def resnet34_keras(input_shape, num_classes, learning_rate):
-    """Keras ResNet-34 adapted for CIFAR/MNIST-style inputs.
-
-    Four stages with blocks [3,4,6,3] and filters [64,128,256,512].
-    Downsampling at the first block of stages 2-4.
-    """
-
+    """Keras ResNet-34 adapted for CIFAR/MNIST-style inputs."""
     inputs = keras.Input(shape=input_shape)
-
-    # Initial conv
     x = _resnet_layer(inputs=inputs, num_filters=64)
 
     stages = [
@@ -252,9 +266,7 @@ def resnet34_keras(input_shape, num_classes, learning_rate):
 
     for si, (num_blocks, num_filters) in enumerate(stages):
         for bi in range(num_blocks):
-            strides = 1
-            if si > 0 and bi == 0:
-                strides = 2
+            strides = 2 if (si > 0 and bi == 0) else 1
 
             y = _resnet_layer(inputs=x, num_filters=num_filters, strides=strides)
             y = _resnet_layer(inputs=y, num_filters=num_filters, activation=None)
@@ -276,10 +288,8 @@ def resnet34_keras(input_shape, num_classes, learning_rate):
     outputs = keras.layers.Dense(num_classes, activation="softmax", kernel_initializer="he_normal")(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs)
-
-    optimizer = SGD(learning_rate=learning_rate, momentum=0.9, clipnorm=1.0)
+    optimizer = _sgd_with_momentum_wd(learning_rate=learning_rate)
     model.compile(loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"])
-
     return model
 
 

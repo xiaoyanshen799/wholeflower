@@ -1,0 +1,15 @@
+---
+_target_: flwr.server.strategy.FedYogi
+min_available_clients: ${num_clients}
+fraction_fit: ${server.reporting_fraction}
+fraction_evaluate: ${fraction_evaluate}
+eta: ${server.learning_rate}
+tau: 0.001
+beta_1: 0.9
+beta_2: 0.99
+on_fit_config_fn:
+  _target_: fedavgm.server.get_on_fit_config
+  config: ${client}
+initial_parameters:
+  _target_: fedavgm.models.model_to_parameters
+  model: ${model}

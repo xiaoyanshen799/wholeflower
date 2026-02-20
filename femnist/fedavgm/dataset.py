@@ -11,17 +11,33 @@ from tensorflow import keras
 
 from fedavgm.common import create_lda_partitions
 
+CIFAR10_MEAN = np.array([0.4914, 0.4822, 0.4465], dtype=np.float32)
+CIFAR10_STD = np.array([0.2023, 0.1994, 0.2010], dtype=np.float32)
+
+
+def preprocess_cifar_images(x: np.ndarray, *, standardize: bool = True) -> np.ndarray:
+    """Convert CIFAR tensors to float32 and apply standard normalization."""
+    x = x.astype(np.float32, copy=False)
+    if x.size == 0:
+        return x
+    # Raw partitions are usually uint8 [0,255]; convert to [0,1] first.
+    if np.nanmax(x) > 1.5:
+        x = x / 255.0
+    if standardize:
+        x = (x - CIFAR10_MEAN.reshape((1, 1, 1, 3))) / CIFAR10_STD.reshape((1, 1, 1, 3))
+    return x
+
 
 def cifar10(num_classes, input_shape):
     """Prepare the CIFAR-10.
 
-    This method considers CIFAR-10 for creating both train and test sets. The sets are
-    already normalized.
+    This method considers CIFAR-10 for creating both train and test sets.
+    It uses standard CIFAR normalization (mean/std), which is the mainstream setup.
     """
     print(f">>> [Dataset] Loading CIFAR-10. {num_classes} | {input_shape}.")
     (x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
-    x_train = x_train.astype("float32") / 255
-    x_test = x_test.astype("float32") / 255
+    x_train = preprocess_cifar_images(x_train, standardize=True)
+    x_test = preprocess_cifar_images(x_test, standardize=True)
     input_shape = x_train.shape[1:]
     num_classes = len(np.unique(y_train))
 

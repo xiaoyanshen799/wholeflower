@@ -108,7 +108,16 @@ def get_evaluate_fn(
             x_eval = x_test[indices]
             y_eval = y_test[indices]
 
-        if getattr(y_eval, "ndim", 1) == 2:
+        # Normalize label shape:
+        # - (N, 1) should be treated as single-label classification
+        # - (N, K), K>1 is multi-label (multi-hot)
+        y_eval = np.asarray(y_eval)
+        if y_eval.ndim == 2 and y_eval.shape[1] == 1:
+            y_eval = y_eval.reshape(-1)
+
+        is_multilabel = y_eval.ndim == 2 and y_eval.shape[1] > 1
+
+        if is_multilabel:
             logits = model.predict(x_eval, batch_size=256, verbose=False)
             loss, metrics = _multilabel_eval(logits, y_eval)
             if log_path:
@@ -123,9 +132,9 @@ def get_evaluate_fn(
 
         # Choose label format based on compiled loss
         if _uses_sparse_categorical_loss(model.loss):
-            labels = y_eval
+            labels = y_eval.reshape(-1) if getattr(y_eval, "ndim", 1) > 1 else y_eval
         else:
-            labels = to_categorical(y_eval, num_classes=num_classes)
+            labels = to_categorical(y_eval.reshape(-1), num_classes=num_classes)
 
         loss, accuracy = model.evaluate(x_eval, labels, verbose=False)
 

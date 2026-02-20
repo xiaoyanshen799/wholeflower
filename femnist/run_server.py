@@ -28,6 +28,7 @@ from fedavgm.models import (
     model_to_parameters,
     mobilenet_v2_075,
     mobilenet_v2_100,
+    resnet18_refl,
     resnet18_keras,
     resnet34_keras,
     resnet20_keras,
@@ -41,7 +42,7 @@ from fedavgm.models import (
     embed_bilstm_mlp_bce,
 )
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
-from strategy import QuantizedFedAvgM
+from strategy import CsvFedAvg, QuantizedFedAvgM
 from baseline_selection import FedCSStrategy, TiFLStrategy
 import grpc
 from concurrent import futures
@@ -68,6 +69,18 @@ grpc.server = _srv
 
 def _configure_tf_gpu_memory_growth() -> None:
     """Enable on-demand GPU memory allocation for TensorFlow."""
+    if os.environ.get("FORCE_TF_CPU", "0") == "1":
+        try:
+            tf.config.set_visible_devices([], "GPU")
+            logging.info("FORCE_TF_CPU=1, hiding all TensorFlow GPUs")
+        except RuntimeError as exc:
+            logging.warning("Failed to force CPU mode: %s", exc)
+        return
+
+    if os.environ.get("SKIP_TF_GPU_MEMORY_GROWTH", "0") == "1":
+        logging.info("Skipping TensorFlow GPU memory-growth probe")
+        return
+
     gpus = tf.config.list_physical_devices("GPU")
     for gpu in gpus:
         try:
@@ -137,7 +150,6 @@ def _load_dataset(name: str, *, shakespeare_dir=None, speech_dir=None, stackover
 
 
 def main() -> None:
-    _configure_tf_gpu_memory_growth()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -159,8 +171,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--strategy",
-        default="custom-fedavgm",
-        choices=["fedavg", "fedavgm", "custom-fedavgm", "fedcs", "tifl"],
+        default="fedavg",
+        choices=["fedavg", "fedavg-csv", "fedavgm", "custom-fedavgm", "fedyogi", "fedcs", "tifl"],
         help="Aggregation strategy",
     )
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
@@ -169,10 +181,11 @@ def main() -> None:
     parser.add_argument("--server-lr", type=float, default=0.01, help="Server learning rate (FedAvgM)")
     parser.add_argument(
         "--model",
-        default="resnet20",
+        default="resnet18_refl",
         choices=[
             "cnn",
             "tf_example",
+            "resnet18_refl",
             "resnet18",
             "resnet34",
             "resnet20",
@@ -190,9 +203,18 @@ def main() -> None:
     )
     parser.add_argument("--server-momentum", type=float, default=0.9, help="Server momentum (FedAvgM)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Client local epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Client batch size")
+    parser.add_argument("--batch-size", type=int, default=10, help="Client batch size")
     parser.add_argument("--client-lr", type=float, default=0.01, help="Client learning rate (to build initial model)")
+    parser.add_argument("--yogi-eta", type=float, default=0.01, help="FedYogi: server eta")
+    parser.add_argument("--yogi-tau", type=float, default=1e-3, help="FedYogi: tau for adaptive denominator")
+    parser.add_argument("--yogi-beta1", type=float, default=0.9, help="FedYogi: beta1")
+    parser.add_argument("--yogi-beta2", type=float, default=0.99, help="FedYogi: beta2")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Force TensorFlow server process to run on CPU (hide all GPUs).",
+    )
     parser.add_argument("--csv-path", default="logs/comm_times.csv", help="CSV file to log per-round per-client timing metrics")
     parser.add_argument("--data-dir-shakespeare", type=Path, default=None, help="Path to Shakespeare partitions (optional)")
     parser.add_argument("--data-dir-speech", type=Path, default=None, help="Path to Speech Commands partitions (optional)")
@@ -307,6 +329,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.cpu_only:
+        os.environ["FORCE_TF_CPU"] = "1"
+    _configure_tf_gpu_memory_growth()
 
     profile_url = None
     if args.profile_http_port and args.profile_http_port > 0:
@@ -387,6 +412,7 @@ def main() -> None:
     model_builders = {
         "cnn": cnn,
         "tf_example": tf_example,
+        "resnet18_refl": resnet18_refl,
         "resnet18": resnet18_keras,
         "resnet34": resnet34_keras,
         "resnet20": resnet20_keras,
@@ -478,6 +504,16 @@ def main() -> None:
             evaluate_fn=evaluate_fn,
             initial_parameters=initial_parameters,
         )
+    elif args.strategy == "fedavg-csv":
+        strategy = CsvFedAvg(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            csv_log_path=args.csv_path,
+        )
     elif args.strategy == "fedavgm":
         from flwr.server.strategy import FedAvgM
 
@@ -490,6 +526,21 @@ def main() -> None:
             initial_parameters=initial_parameters,
             server_learning_rate=args.server_lr,
             server_momentum=args.server_momentum,
+        )
+    elif args.strategy == "fedyogi":
+        from flwr.server.strategy import FedYogi
+
+        strategy = FedYogi(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            eta=args.yogi_eta,
+            tau=args.yogi_tau,
+            beta_1=args.yogi_beta1,
+            beta_2=args.yogi_beta2,
         )
     elif args.strategy == "fedcs":
         strategy = FedCSStrategy(

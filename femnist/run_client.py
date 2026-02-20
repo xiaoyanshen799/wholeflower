@@ -18,6 +18,14 @@ tf.config.threading.set_inter_op_parallelism_threads(1)
 
 def _configure_tf_gpu_memory_growth() -> None:
     """Enable on-demand GPU memory allocation for TensorFlow."""
+    if os.environ.get("FORCE_TF_CPU", "0") == "1":
+        try:
+            tf.config.set_visible_devices([], "GPU")
+            logging.info("FORCE_TF_CPU=1, hiding all TensorFlow GPUs")
+        except RuntimeError as exc:
+            logging.warning("Failed to force CPU mode: %s", exc)
+        return
+
     # On some container/runtime stacks (e.g. K3s + HAMi), probing GPU devices
     # can block indefinitely. Allow skipping this step via env var.
     if os.environ.get("SKIP_TF_GPU_MEMORY_GROWTH", "0") == "1":
@@ -31,7 +39,12 @@ def _configure_tf_gpu_memory_growth() -> None:
             logging.warning("Failed to enable memory growth for %s: %s", gpu, exc)
 
 from client import FlowerClient
-from fedavgm.dataset import load_stackoverflow_meta, remap_shakespeare, remap_stackoverflow_labels
+from fedavgm.dataset import (
+    load_stackoverflow_meta,
+    preprocess_cifar_images,
+    remap_shakespeare,
+    remap_stackoverflow_labels,
+)
 
 # --- add: gRPC keepalive monkey patch (client) ---
 import grpc
@@ -117,6 +130,42 @@ def _build_speech_ds(files, labels, data_root: Path, batch_size: int, training: 
     return ds
 
 
+_CIFAR_MEAN_TF = tf.constant([0.4914, 0.4822, 0.4465], dtype=tf.float32)
+_CIFAR_STD_TF = tf.constant([0.2023, 0.1994, 0.2010], dtype=tf.float32)
+
+
+def _cifar_augment(image: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+    image = tf.image.resize_with_crop_or_pad(image, 40, 40)
+    image = tf.image.random_crop(image, size=[32, 32, 3])
+    image = tf.image.random_flip_left_right(image)
+    return image, label
+
+
+def _cifar_standardize(image: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+    image = (image - _CIFAR_MEAN_TF) / _CIFAR_STD_TF
+    return image, label
+
+
+def _build_image_ds(
+    images: np.ndarray,
+    labels: np.ndarray,
+    batch_size: int,
+    *,
+    training: bool,
+    cifar_pipeline: bool = False,
+) -> tf.data.Dataset:
+    ds = tf.data.Dataset.from_tensor_slices((images, labels))
+    if training:
+        ds = ds.shuffle(min(len(images), 10_000), reshuffle_each_iteration=True)
+    if cifar_pipeline:
+        if training:
+            ds = ds.map(_cifar_augment, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(_cifar_standardize, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
 def main() -> None:
     _configure_tf_gpu_memory_growth()
     parser = argparse.ArgumentParser(description="Run Flower client.")
@@ -132,10 +181,11 @@ def main() -> None:
     parser.add_argument("--num-classes", type=int, default=10, help="Total number of classes in dataset")
     parser.add_argument(
         "--model",
-        default="resnet20",
+        default="resnet18_refl",
         choices=[
             "cnn",
             "tf_example",
+            "resnet18_refl",
             "resnet18",
             "resnet34",
             "resnet20",
@@ -284,12 +334,19 @@ def main() -> None:
         input_shape = [int(x_full.shape[1])]
     else:
         # Image-style datasets
-        if x_full.dtype != np.float32:
-            x_full = x_full.astype(np.float32)
-        if x_full.max() > 1.0:
-            x_full /= 255.0
+        if dataset_name == "cifar10":
+            # Keep [0,1] arrays here; standardization is applied in tf.data pipeline.
+            x_full = preprocess_cifar_images(x_full, standardize=False)
+        else:
+            if x_full.dtype != np.float32:
+                x_full = x_full.astype(np.float32)
+            if x_full.max() > 1.0:
+                x_full /= 255.0
         if x_full.ndim == 3:
             x_full = np.expand_dims(x_full, axis=-1)
+        y_full = np.asarray(y_full)
+        if y_full.ndim > 1:
+            y_full = y_full.reshape(-1)
 
         split_idx = int(0.9 * len(x_full))
         x_train, y_train = x_full[:split_idx], y_full[:split_idx]
@@ -297,11 +354,39 @@ def main() -> None:
 
         num_classes = args.num_classes
         input_shape = list(x_full.shape[1:])
+        if dataset_name == "cifar10":
+            y_train = y_train.astype(np.int64, copy=False)
+            y_val = y_val.astype(np.int64, copy=False)
+            train_size = len(x_train)
+            val_size = len(x_val)
+            use_sparse_labels = True
+
+            def _train_fn(batch_size, training=True):
+                return _build_image_ds(
+                    x_train,
+                    y_train,
+                    batch_size,
+                    training=training,
+                    cifar_pipeline=True,
+                )
+
+            def _val_fn(batch_size, training=False):
+                return _build_image_ds(
+                    x_val,
+                    y_val,
+                    batch_size,
+                    training=training,
+                    cifar_pipeline=True,
+                )
+
+            train_ds_fn = _train_fn
+            val_ds_fn = _val_fn
 
     # Build Hydra-style config dict for FlowerClient
     target_map = {
         "cnn": "fedavgm.models.cnn",
         "tf_example": "fedavgm.models.tf_example",
+        "resnet18_refl": "fedavgm.models.resnet18_refl",
         "resnet18": "fedavgm.models.resnet18_keras",
         "resnet34": "fedavgm.models.resnet34_keras",
         "resnet20": "fedavgm.models.resnet20_keras",
@@ -386,7 +471,7 @@ def main() -> None:
         params = client.get_parameters({})
         # Fall back to sensible defaults if overrides are not provided.
         epochs = args.epochs if args.epochs is not None else 1
-        batch_size = args.batch_size if args.batch_size is not None else 64
+        batch_size = args.batch_size if args.batch_size is not None else 10
         total_time = 0.0
         for r in range(1, rounds + 1):
             _, _, metrics = client.fit(

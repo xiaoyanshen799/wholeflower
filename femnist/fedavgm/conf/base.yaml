@@ -14,11 +14,11 @@ server:
   reporting_fraction: 0.05  # values used in the paper 0.05, 0.1, 0.2 (not used for Figure 5), 0.4
 
 client:
-  local_epochs: 5   # in the paper it is used 1 or 5
-  batch_size: 32    # in the paper fixed at 64
+  local_epochs: 1   # REFL CIFAR10 setup
+  batch_size: 10    # REFL CIFAR10 setup
   lr: 0.01          # client learning rate
 
 defaults:
-  - strategy: custom-fedavgm
-  - model: cnn
+  - strategy: fedavg
+  - model: resnet18_refl
   - dataset: cifar10

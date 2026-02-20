@@ -18,6 +18,7 @@ MPS_ENABLE=${MPS_ENABLE:-1}
 MPS_PERCENT=${MPS_PERCENT:-5}
 MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
 MPS_LOG_DIRECTORY=${MPS_LOG_DIRECTORY:-/tmp/nvidia-mps}
+CPU_ONLY=${CPU_ONLY:-0}
 
 PY=${PY:-python3}
 # Accept common wrappers like "( python3 )" and optional args like "python3 -u".
@@ -64,6 +65,14 @@ ENV_VARS=(
   --setenv=CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY"
 )
 
+if [[ "$CPU_ONLY" == "1" ]]; then
+  ENV_VARS+=(
+    --setenv=CUDA_VISIBLE_DEVICES=
+    --setenv=FORCE_TF_CPU=1
+    --setenv=SKIP_TF_GPU_MEMORY_GROWTH=1
+  )
+fi
+
 echo "Data dir    : $DATA_DIR_ABS"
 echo "Server      : $SERVER"
 echo "Max clients : ${MAX_CLIENTS}"
@@ -77,6 +86,7 @@ echo "MPS enable  : $MPS_ENABLE"
 echo "MPS percent : $MPS_PERCENT"
 echo "MPS pipe dir: $MPS_PIPE_DIRECTORY"
 echo "MPS log dir : $MPS_LOG_DIRECTORY"
+echo "CPU only    : $CPU_ONLY"
 echo
 
 shopt -s nullglob
@@ -96,6 +106,11 @@ fi
 SYSTEMD_RUN+=(--collect --scope --no-block)
 
 ensure_mps_daemon() {
+  if [[ "$CPU_ONLY" == "1" ]]; then
+    echo "CPU_ONLY=1, skipping MPS daemon setup"
+    return 0
+  fi
+
   if [[ "$MPS_ENABLE" != "1" ]]; then
     echo "MPS disabled by MPS_ENABLE=$MPS_ENABLE"
     return 0

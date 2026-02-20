@@ -29,6 +29,136 @@ from flwr.server.strategy.aggregate import aggregate
 from compression import ErrorFeedbackQuantizer, maybe_unpack_quantized
 
 
+class CsvFedAvg(FedAvg):
+    """FedAvg with per-client CSV logging."""
+
+    def __init__(
+        self,
+        *,
+        fraction_fit: float = 1.0,
+        fraction_evaluate: float = 1.0,
+        min_fit_clients: int = 2,
+        min_evaluate_clients: int = 2,
+        min_available_clients: int = 2,
+        evaluate_fn: Optional[
+            Callable[[int, NDArrays, Dict[str, Scalar]], Optional[Tuple[float, Dict[str, Scalar]]]]
+        ] = None,
+        on_fit_config_fn: Optional[Callable[[int], Dict[str, Scalar]]] = None,
+        on_evaluate_config_fn: Optional[Callable[[int], Dict[str, Scalar]]] = None,
+        accept_failures: bool = True,
+        initial_parameters: Parameters = None,
+        fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
+        evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
+        csv_log_path: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            fraction_fit=fraction_fit,
+            fraction_evaluate=fraction_evaluate,
+            min_fit_clients=min_fit_clients,
+            min_evaluate_clients=min_evaluate_clients,
+            min_available_clients=min_available_clients,
+            evaluate_fn=evaluate_fn,
+            on_fit_config_fn=on_fit_config_fn,
+            on_evaluate_config_fn=on_evaluate_config_fn,
+            accept_failures=accept_failures,
+            initial_parameters=initial_parameters,
+            fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
+            evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
+        )
+        self.csv_log_path = csv_log_path
+
+    def __repr__(self) -> str:
+        return f"CsvFedAvg(accept_failures={self.accept_failures})"
+
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, FitRes]],
+        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+        parameters_aggregated, metrics_aggregated = super().aggregate_fit(server_round, results, failures)
+
+        if self.csv_log_path and results:
+            os.makedirs(os.path.dirname(self.csv_log_path), exist_ok=True)
+            file_exists = os.path.exists(self.csv_log_path)
+            with open(self.csv_log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(
+                        [
+                            "server_round",
+                            "client_id",
+                            "num_examples",
+                            "server_to_client_ms",
+                            "server_wait_ms",
+                            "client_train_s",
+                            "edcode_s",
+                            "client_to_server_ms",
+                            "server_receive_time",
+                            "config_time",
+                            "cpu_freq_start_mhz",
+                            "cpu_freq_end_mhz",
+                            "cpu_time_start_s",
+                            "cpu_time_end_s",
+                            "cpu_time_elapsed_s",
+                            "sched_run_time_ns",
+                            "sched_runqueue_time_ns",
+                            "sched_runqueue_time_s",
+                            "sched_timeslices",
+                        ]
+                    )
+                server_receive_time = time.time()
+                for client_proxy, fit_res in results:
+                    cid = getattr(client_proxy, "cid", "?")
+                    m = fit_res.metrics or {}
+                    stc = m.get("server_to_client_ms", None)
+                    swt = m.get("server_wait_time", None)
+                    train_s = m.get("train_time", None)
+                    edcode = m.get("edcode", None)
+                    config_time = m.get("config_time", None)
+                    cpu_start = m.get("cpu_freq_start_mhz")
+                    cpu_end = m.get("cpu_freq_end_mhz")
+                    cpu_time_start = m.get("cpu_time_start_s")
+                    cpu_time_end = m.get("cpu_time_end_s")
+                    cpu_time_elapsed = m.get("cpu_time_elapsed_s")
+                    sched_run_ns = m.get("sched_run_time_ns")
+                    sched_runqueue_ns = m.get("sched_runqueue_time_ns")
+                    sched_runqueue_s = m.get("sched_runqueue_time_s")
+                    sched_timeslices = m.get("sched_timeslices")
+                    c2s_ms = None
+                    server_arrival_time = m.get("server_arrival_time")
+                    if "client_fit_end_time" in m and server_arrival_time:
+                        c2s_ms = max(
+                            0.0,
+                            (server_arrival_time - float(m["client_fit_end_time"])) * 1000.0,
+                        )
+                    writer.writerow(
+                        [
+                            server_round,
+                            cid,
+                            fit_res.num_examples,
+                            f"{stc:.3f}" if stc is not None else "",
+                            f"{swt:.3f}" if swt is not None else "",
+                            f"{train_s:.3f}" if train_s is not None else "",
+                            f"{edcode:.3f}" if edcode is not None else "",
+                            f"{c2s_ms:.3f}" if c2s_ms is not None else "",
+                            f"{server_receive_time:.3f}",
+                            f"{time.time() - config_time:.3f}" if config_time is not None else "",
+                            f"{cpu_start:.3f}" if cpu_start is not None else "",
+                            f"{cpu_end:.3f}" if cpu_end is not None else "",
+                            f"{cpu_time_start:.6f}" if cpu_time_start is not None else "",
+                            f"{cpu_time_end:.6f}" if cpu_time_end is not None else "",
+                            f"{cpu_time_elapsed:.6f}" if cpu_time_elapsed is not None else "",
+                            f"{sched_run_ns:.0f}" if sched_run_ns is not None else "",
+                            f"{sched_runqueue_ns:.0f}" if sched_runqueue_ns is not None else "",
+                            f"{sched_runqueue_s:.6f}" if sched_runqueue_s is not None else "",
+                            f"{sched_timeslices:.0f}" if sched_timeslices is not None else "",
+                        ]
+                    )
+
+        return parameters_aggregated, metrics_aggregated
+
+
 class QuantizedFedAvgM(FedAvg):
     """Re-implementation of FedAvgM with downlink quantization support."""
 

@@ -51,9 +51,17 @@ def _is_isic(name: str) -> bool:
     return name.lower() in {"isic", "isic2019", "fed-isic2019", "fed_isic2019"}
 
 
+def _is_cifar100(name: str) -> bool:
+    return name.lower() in {"cifar100", "fed-cifar100", "fed_cifar100", "cifar100-resnet"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
-    parser.add_argument("--dataset", default="cifar10", help="cifar10 | fmnist | femnist | ixi | isic")
+    parser.add_argument(
+        "--dataset",
+        default="cifar10",
+        help="cifar10 | fmnist | femnist | ixi | isic | cifar100",
+    )
     parser.add_argument("--strategy", default="custom-fedavgm", choices=["fedavg", "fedavgm", "custom-fedavgm"], help="Aggregation strategy")
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
     parser.add_argument("--clients", type=int, default=10, help="Expected total number of clients")
@@ -71,9 +79,15 @@ def main() -> None:
     parser.add_argument("--client-lr", type=float, default=0.05, help="Client learning rate (to build initial model)")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
     parser.add_argument("--csv-path", default="logs/comm_times.csv", help="CSV file to log per-round per-client timing metrics")
+    parser.add_argument("--data-dir", default="data_partitions_cifar100", help="Partition directory for CIFAR-100 NPZ files")
     parser.add_argument("--data-root", default="data/fed_ixi", help="Fed-IXI dataset root (IXI_sample folder inside)")
     parser.add_argument("--isic-preprocessed-dir", default="ISIC_2019_Training_Input_preprocessed", help="ISIC preprocessed image folder (relative to --data-root)")
     parser.add_argument("--isic-split-csv", default=None, help="Path to ISIC train_test_split file")
+    parser.add_argument(
+        "--no-pretrained",
+        action="store_true",
+        help="Disable ImageNet pretrained weights for vision backbones",
+    )
     parser.add_argument(
         "--downlink-num-bits",
         type=int,
@@ -100,12 +114,15 @@ def main() -> None:
         args.batch_size = 2
     if _is_isic(args.dataset) and "--batch-size" not in sys.argv:
         args.batch_size = 32
+    if _is_cifar100(args.dataset) and "--batch-size" not in sys.argv:
+        args.batch_size = 32
 
     # ------------------------------------------------------------------
     # Build initial model to obtain parameter shapes
     # ------------------------------------------------------------------
     use_ixi = _is_ixi(args.dataset)
     use_isic = _is_isic(args.dataset)
+    use_cifar100 = _is_cifar100(args.dataset)
     if use_ixi:
         import torch
         from flwr.common import ndarrays_to_parameters
@@ -132,6 +149,19 @@ def main() -> None:
         input_shape = (3, 200, 200)
         num_classes = 8
         x_train = y_train = x_test = y_test = None
+    elif use_cifar100:
+        import torch
+        from flwr.common import ndarrays_to_parameters
+
+        from cifar100_flower import evaluate_cifar100, get_model_parameters
+        from cifar100_model import build_resnet152
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = build_resnet152(num_classes=100, pretrained=not args.no_pretrained).to(device)
+        initial_parameters = ndarrays_to_parameters(get_model_parameters(model))
+        input_shape = (3, 224, 224)
+        num_classes = 100
+        x_train = y_train = x_test = y_test = None
     else:
         x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(args.dataset)
         model = None
@@ -140,13 +170,14 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = logs_dir / f"server_{timestamp}.log"
     with log_file.open("w", encoding="utf-8") as f:
+        model_name = "resnet152_imagenet224" if use_cifar100 else args.model
         f.write(
             "dataset={dataset} model={model} rounds={rounds} clients={clients} "
             "local_epochs={local_epochs} batch_size={batch_size} reporting_fraction={reporting_fraction} "
             "server_lr={server_lr} server_momentum={server_momentum} downlink_num_bits={downlink_num_bits} "
             "eval_sample_size={eval_sample_size}\n".format(
                 dataset=args.dataset,
-                model=args.model,
+                model=model_name,
                 rounds=args.rounds,
                 clients=args.clients,
                 local_epochs=args.local_epochs,
@@ -158,7 +189,7 @@ def main() -> None:
                 eval_sample_size=args.eval_sample_size,
             )
         )
-    if not use_ixi and not use_isic:
+    if not use_ixi and not use_isic and not use_cifar100:
         from fedavgm.models import (
             cnn,
             model_to_parameters,
@@ -183,7 +214,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Fit/eval configuration helpers
     # ------------------------------------------------------------------
-    if use_ixi or use_isic:
+    if use_ixi or use_isic or use_cifar100:
         import time
 
         def fit_config_fn(server_round: int):  # pylint: disable=unused-argument
@@ -252,6 +283,31 @@ def main() -> None:
                 )
                 Path(log_file).open("a", encoding="utf-8").write(entry)
             return loss, {"balanced_accuracy": bal_acc}
+    elif use_cifar100:
+        from flwr.common import parameters_to_ndarrays
+
+        def evaluate_fn(server_round: int, parameters, config):  # pylint: disable=unused-argument
+            if hasattr(parameters, "tensors"):
+                params_list = parameters_to_ndarrays(parameters)
+            else:
+                params_list = parameters
+            loss, accuracy = evaluate_cifar100(
+                model,
+                params_list,
+                data_dir=args.data_dir,
+                device=device,
+                batch_size=args.batch_size,
+                num_workers=0,
+                sample_size=sample_size,
+                sample_seed=args.eval_sample_seed,
+            )
+            if log_file:
+                entry = (
+                    f"round={server_round} loss={loss:.6f} accuracy={accuracy:.6f} "
+                    f"samples={sample_size or 'all'}\n"
+                )
+                Path(log_file).open("a", encoding="utf-8").write(entry)
+            return loss, {"accuracy": accuracy}
     else:
         evaluate_fn = get_evaluate_fn(
             model,

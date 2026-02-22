@@ -67,6 +67,42 @@ def _read_schedstat() -> Optional[Tuple[int, int, int]]:
     return run_ns, runqueue_ns, timeslices
 
 
+def _set_optimizer_lr(model: tf.keras.Model, lr: float) -> bool:
+    """Best-effort update of optimizer learning rate."""
+    try:
+        optimizer = model.optimizer
+    except Exception:
+        return False
+    if optimizer is None:
+        return False
+
+    lr_obj = None
+    if hasattr(optimizer, "learning_rate"):
+        lr_obj = optimizer.learning_rate
+    elif hasattr(optimizer, "lr"):
+        lr_obj = optimizer.lr
+    else:
+        return False
+
+    try:
+        if hasattr(lr_obj, "assign"):
+            lr_obj.assign(lr)
+        else:
+            tf.keras.backend.set_value(lr_obj, lr)
+        return True
+    except Exception:
+        try:
+            if hasattr(optimizer, "learning_rate"):
+                optimizer.learning_rate = lr
+            elif hasattr(optimizer, "lr"):
+                optimizer.lr = lr
+            else:
+                return False
+            return True
+        except Exception:
+            return False
+
+
 class FlowerClient(fl.client.NumPyClient):
     """Client wrapper that handles model setup and uplink compression."""
 
@@ -211,6 +247,13 @@ class FlowerClient(fl.client.NumPyClient):
             if self._batch_size_override is not None
             else config.get("batch_size")
         )
+        client_lr = config.get("client_lr", None)
+        if isinstance(client_lr, (int, float)):
+            applied = _set_optimizer_lr(self.model, float(client_lr))
+            if applied:
+                logging.info("[Client] Applied per-round learning rate: %.8f", float(client_lr))
+            else:
+                logging.warning("[Client] Failed to apply per-round learning rate: %s", client_lr)
 
         logging.info(
             "[Client] Starting local training: epochs=%s batch_size=%s",
@@ -248,6 +291,7 @@ class FlowerClient(fl.client.NumPyClient):
         metrics = {
             "local_epochs_used": float(epochs) if epochs is not None else None,
             "batch_size_used": float(batch_size) if batch_size is not None else None,
+            "client_lr": float(client_lr) if isinstance(client_lr, (int, float)) else None,
         }
         if isinstance(server_to_client_ms, (int, float)):
             metrics["server_to_client_ms"] = float(server_to_client_ms)

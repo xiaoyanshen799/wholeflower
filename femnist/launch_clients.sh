@@ -3,22 +3,63 @@ set -euo pipefail
 
 # 使用方式：
 #   PY=/path/to/python ./launch_clients.sh [DATA_DIR] [SERVER_ADDR] [MAX_CLIENTS]
+#   PY=/path/to/python ./launch_clients.sh --preset refl-cpu [DATA_DIR] [SERVER_ADDR] [MAX_CLIENTS]
 #
 # 例子：
 #   PY=$(which python3) ./launch_clients.sh data_partitions 172.31.17.220:8081 42
+#   PY=$(which python3) ./launch_clients.sh --preset refl-cpu data_partitions_cifar10 127.0.0.1:8081 20
+#   PRESET=refl-cpu PY=$(which python3) ./launch_clients.sh data_partitions_cifar10 127.0.0.1:8081 20
+
+PRESET=${PRESET:-default}
+if [[ "${1:-}" == "--preset" ]]; then
+  PRESET=${2:-}
+  if [[ -z "$PRESET" ]]; then
+    echo "Missing preset name after --preset"
+    exit 1
+  fi
+  shift 2
+fi
 
 DATA_DIR=${1:-data_partitions}
 SERVER=${2:-"127.0.0.1:8081"}
 MAX_CLIENTS=${3:-4}   # 默认仅启动前 4 个；设为 0 启动目录里所有 client_*.npz
-DATASET=${DATASET:-speech_commands}
-MODEL=${MODEL:-resnet34}
-BATCH_SIZE=${BATCH_SIZE:-8}
-LR=${LR:-0.001}
-MPS_ENABLE=${MPS_ENABLE:-1}
+DATASET=${DATASET:-}
+MODEL=${MODEL:-}
+BATCH_SIZE=${BATCH_SIZE:-}
+LR=${LR:-}
+MPS_ENABLE=${MPS_ENABLE:-}
+MPS_PERCENT=${MPS_PERCENT:-}
+MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-}
+MPS_LOG_DIRECTORY=${MPS_LOG_DIRECTORY:-}
+CPU_ONLY=${CPU_ONLY:-}
+
+case "$PRESET" in
+  default)
+    DATASET=${DATASET:-speech_commands}
+    MODEL=${MODEL:-resnet34}
+    BATCH_SIZE=${BATCH_SIZE:-8}
+    LR=${LR:-0.001}
+    MPS_ENABLE=${MPS_ENABLE:-1}
+    CPU_ONLY=${CPU_ONLY:-0}
+    ;;
+  refl-cpu)
+    DATASET=${DATASET:-cifar10}
+    MODEL=${MODEL:-resnet18_refl}
+    BATCH_SIZE=${BATCH_SIZE:-10}
+    LR=${LR:-0.01}
+    CPU_ONLY=${CPU_ONLY:-1}
+    MPS_ENABLE=${MPS_ENABLE:-0}
+    ;;
+  *)
+    echo "Unknown preset: $PRESET"
+    echo "Supported presets: default, refl-cpu"
+    exit 1
+    ;;
+esac
+
 MPS_PERCENT=${MPS_PERCENT:-5}
 MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
 MPS_LOG_DIRECTORY=${MPS_LOG_DIRECTORY:-/tmp/nvidia-mps}
-CPU_ONLY=${CPU_ONLY:-0}
 
 PY=${PY:-python3}
 # Accept common wrappers like "( python3 )" and optional args like "python3 -u".
@@ -81,6 +122,7 @@ echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
 echo "CPU affinity: disabled"
+echo "Preset      : $PRESET"
 echo "LR          : $LR"
 echo "MPS enable  : $MPS_ENABLE"
 echo "MPS percent : $MPS_PERCENT"

@@ -15,13 +15,26 @@ def get_on_fit_config(config: DictConfig):
     The config dict is sent to the client fit() method.
     """
 
+    def _client_lr_for_round(server_round: int) -> float:
+        base_lr = float(config.get("client_lr", 0.01))
+        decay_factor = float(config.get("client_lr_decay_factor", 1.0))
+        decay_every = int(config.get("client_lr_decay_every_rounds", 0))
+        min_lr = float(config.get("client_lr_min", 0.0))
+
+        if decay_every > 0 and decay_factor > 0.0 and decay_factor != 1.0:
+            # Match REFL-style schedule: decay after each decay_every completed rounds.
+            decay_steps = max(0, (int(server_round) - 1) // decay_every)
+            lr = base_lr * (decay_factor ** decay_steps)
+        else:
+            lr = base_lr
+        return float(max(min_lr, lr))
+
     def fit_config_fn(server_round: int):  # pylint: disable=unused-argument
-        # option to use scheduling of learning rate based on round
-        # if server_round > 50:
-        #     lr = config.lr / 10
+        client_lr = _client_lr_for_round(server_round)
         return {
             "local_epochs": config.local_epochs,
             "batch_size": config.batch_size,
+            "client_lr": client_lr,
             "confit_time": time.time(),
         }
 

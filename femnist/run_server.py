@@ -12,6 +12,7 @@ os.environ.setdefault("FLWR_TELEMETRY_ENABLED", "0")
 import flwr as fl
 from omegaconf import OmegaConf
 import tensorflow as tf
+from flwr.server.client_manager import SimpleClientManager
 
 from fedavgm.dataset import (
     cifar10,
@@ -43,6 +44,8 @@ from fedavgm.models import (
 )
 from fedavgm.server import get_on_fit_config, get_evaluate_fn
 from strategy import CsvFedAvg, QuantizedFedAvgM
+from refl_strategy import REFLAsyncSiloStrategy
+from async_server import TrueAsyncServer
 from baseline_selection import FedCSStrategy, TiFLStrategy
 import grpc
 from concurrent import futures
@@ -172,7 +175,17 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         default="fedavg",
-        choices=["fedavg", "fedavg-csv", "fedavgm", "custom-fedavgm", "fedyogi", "fedcs", "tifl"],
+        choices=[
+            "fedavg",
+            "fedavg-csv",
+            "fedavgm",
+            "custom-fedavgm",
+            "fedyogi",
+            "fedcs",
+            "tifl",
+            "refl",
+            "refl-async",
+        ],
         help="Aggregation strategy",
     )
     parser.add_argument("--rounds", type=int, default=50, help="Total federated rounds")
@@ -205,6 +218,24 @@ def main() -> None:
     parser.add_argument("--local-epochs", type=int, default=1, help="Client local epochs")
     parser.add_argument("--batch-size", type=int, default=10, help="Client batch size")
     parser.add_argument("--client-lr", type=float, default=0.01, help="Client learning rate (to build initial model)")
+    parser.add_argument(
+        "--client-lr-decay-factor",
+        type=float,
+        default=0.98,
+        help="Per-round client LR decay factor (REFL-style, applied every --client-lr-decay-every rounds).",
+    )
+    parser.add_argument(
+        "--client-lr-decay-every",
+        type=int,
+        default=10,
+        help="Apply client LR decay every N rounds; 0 disables decay.",
+    )
+    parser.add_argument(
+        "--client-lr-min",
+        type=float,
+        default=5e-5,
+        help="Minimum client LR after decay.",
+    )
     parser.add_argument("--yogi-eta", type=float, default=0.01, help="FedYogi: server eta")
     parser.add_argument("--yogi-tau", type=float, default=1e-3, help="FedYogi: tau for adaptive denominator")
     parser.add_argument("--yogi-beta1", type=float, default=0.9, help="FedYogi: beta1")
@@ -327,6 +358,76 @@ def main() -> None:
         default=None,
         help="TiFL: Credits per tier (Algorithm 2); omit for unlimited.",
     )
+    parser.add_argument(
+        "--refl-stale-factor",
+        type=float,
+        default=-4.0,
+        help="REFL stale factor mode (>1, 1, -1, -2, -3, -4). -4 matches REFL stale-aware weighting.",
+    )
+    parser.add_argument(
+        "--refl-stale-beta",
+        type=float,
+        default=0.35,
+        help="REFL stale_beta used when stale_factor=-4.",
+    )
+    parser.add_argument(
+        "--refl-scale-coff",
+        type=float,
+        default=1.0,
+        help="REFL scale coefficient for stale_factor=-4.",
+    )
+    parser.add_argument(
+        "--refl-stale-update",
+        type=int,
+        default=-1,
+        help="REFL max stale rounds to accept (-1 means no expiry).",
+    )
+    parser.add_argument(
+        "--refl-disable-full-selection",
+        action="store_true",
+        help="REFL: disable full client selection and fall back to fraction_fit sampling.",
+    )
+    parser.add_argument(
+        "--refl-server-update",
+        choices=["fedavg", "fedavgm"],
+        default="fedavg",
+        help="REFL: server-side update rule after stale-aware weighting.",
+    )
+    parser.add_argument(
+        "--refl-use-num-examples",
+        action="store_true",
+        help="REFL: multiply stale-aware importance by num_examples (disabled by default to match REFL).",
+    )
+    parser.add_argument(
+        "--async-round-deadline",
+        type=float,
+        default=30.0,
+        help="REFL-Async: aggregation deadline in seconds; collect arrived updates until this cut.",
+    )
+    parser.add_argument(
+        "--async-min-fraction",
+        type=float,
+        default=0.8,
+        help="REFL-Async: minimum fraction of currently available clients before aggregation.",
+    )
+    parser.add_argument(
+        "--async-min-results",
+        type=int,
+        default=0,
+        help="REFL-Async: minimum arrived updates to aggregate (0 uses async-min-fraction).",
+    )
+    parser.add_argument(
+        "--async-poll-interval",
+        type=float,
+        default=0.5,
+        help="REFL-Async: poll interval in seconds while waiting for new client results.",
+    )
+    parser.add_argument(
+        "--async-max-workers",
+        type=int,
+        default=64,
+        help="REFL-Async: maximum server worker threads for concurrent client RPCs.",
+    )
 
     args = parser.parse_args()
     if args.cpu_only:
@@ -389,8 +490,13 @@ def main() -> None:
         f.write(
             "dataset={dataset} model={model} rounds={rounds} clients={clients} "
             "local_epochs={local_epochs} batch_size={batch_size} reporting_fraction={reporting_fraction} "
-            "server_lr={server_lr} server_momentum={server_momentum} downlink_num_bits={downlink_num_bits} "
-            "eval_sample_size={eval_sample_size}\n".format(
+            "server_lr={server_lr} server_momentum={server_momentum} "
+            "client_lr={client_lr} client_lr_decay_factor={client_lr_decay_factor} "
+            "client_lr_decay_every={client_lr_decay_every} client_lr_min={client_lr_min} "
+            "downlink_num_bits={downlink_num_bits} "
+            "eval_sample_size={eval_sample_size} refl_server_update={refl_server_update} "
+            "refl_use_num_examples={refl_use_num_examples} refl_stale_factor={refl_stale_factor} "
+            "refl_stale_beta={refl_stale_beta} refl_scale_coff={refl_scale_coff}\n".format(
                 dataset=args.dataset,
                 model=args.model,
                 rounds=args.rounds,
@@ -400,8 +506,17 @@ def main() -> None:
                 reporting_fraction=args.reporting_fraction,
                 server_lr=args.server_lr,
                 server_momentum=args.server_momentum,
+                client_lr=args.client_lr,
+                client_lr_decay_factor=args.client_lr_decay_factor,
+                client_lr_decay_every=args.client_lr_decay_every,
+                client_lr_min=args.client_lr_min,
                 downlink_num_bits=args.downlink_num_bits,
                 eval_sample_size=args.eval_sample_size,
+                refl_server_update=args.refl_server_update,
+                refl_use_num_examples=args.refl_use_num_examples,
+                refl_stale_factor=args.refl_stale_factor,
+                refl_stale_beta=args.refl_stale_beta,
+                refl_scale_coff=args.refl_scale_coff,
             )
         )
     # Also mirror Python logging output into the per-run server log file.
@@ -476,7 +591,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Fit/eval configuration helpers
     # ------------------------------------------------------------------
-    cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
+    cfg = OmegaConf.create(
+        {
+            "local_epochs": args.local_epochs,
+            "batch_size": args.batch_size,
+            "client_lr": args.client_lr,
+            "client_lr_decay_factor": args.client_lr_decay_factor,
+            "client_lr_decay_every_rounds": args.client_lr_decay_every,
+            "client_lr_min": args.client_lr_min,
+        }
+    )
     fit_config_fn = get_on_fit_config(cfg)
     sample_size = args.eval_sample_size if args.eval_sample_size > 0 else None
     evaluate_fn = get_evaluate_fn(
@@ -493,6 +617,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Select strategy
     # ------------------------------------------------------------------
+    server_impl = None
     if args.strategy == "fedavg":
         from flwr.server.strategy import FedAvg
 
@@ -582,6 +707,57 @@ def main() -> None:
             credits_per_tier=args.tifl_credits,
             reprofiling_interval_rounds=args.tifl_interval,
         )
+    elif args.strategy == "refl":
+        strategy = REFLAsyncSiloStrategy(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            server_learning_rate=args.server_lr,
+            server_momentum=args.server_momentum,
+            csv_log_path=args.csv_path,
+            downlink_quantization_enabled=args.downlink_num_bits != 0,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 0,
+            stale_factor=args.refl_stale_factor,
+            stale_beta=args.refl_stale_beta,
+            scale_coff=args.refl_scale_coff,
+            stale_update=args.refl_stale_update,
+            refl_server_update=args.refl_server_update,
+            use_num_examples=args.refl_use_num_examples,
+            full_selection=not args.refl_disable_full_selection,
+        )
+    elif args.strategy == "refl-async":
+        strategy = REFLAsyncSiloStrategy(
+            fraction_fit=args.reporting_fraction,
+            fraction_evaluate=0.0,
+            min_available_clients=args.clients,
+            on_fit_config_fn=fit_config_fn,
+            evaluate_fn=evaluate_fn,
+            initial_parameters=initial_parameters,
+            server_learning_rate=args.server_lr,
+            server_momentum=args.server_momentum,
+            csv_log_path=args.csv_path,
+            downlink_quantization_enabled=args.downlink_num_bits != 0,
+            downlink_quantization_bits=args.downlink_num_bits if args.downlink_num_bits != 0 else 0,
+            stale_factor=args.refl_stale_factor,
+            stale_beta=args.refl_stale_beta,
+            scale_coff=args.refl_scale_coff,
+            stale_update=args.refl_stale_update,
+            refl_server_update=args.refl_server_update,
+            use_num_examples=args.refl_use_num_examples,
+            full_selection=not args.refl_disable_full_selection,
+        )
+        server_impl = TrueAsyncServer(
+            client_manager=SimpleClientManager(),
+            strategy=strategy,
+            round_deadline_s=args.async_round_deadline,
+            min_results=args.async_min_results,
+            min_results_fraction=args.async_min_fraction,
+            poll_interval_s=args.async_poll_interval,
+        )
+        server_impl.set_max_workers(args.async_max_workers)
     else:  # custom-fedavgm (default)
         strategy = QuantizedFedAvgM(
             fraction_fit=args.reporting_fraction,
@@ -601,11 +777,18 @@ def main() -> None:
     # Start Flower server
     # ------------------------------------------------------------------
     print(f">>> Starting Flower server on {args.address} with strategy {strategy}…")
-    fl.server.start_server(
-        server_address=args.address,
-        config=fl.server.ServerConfig(num_rounds=args.rounds),
-        strategy=strategy,
-    )
+    if server_impl is None:
+        fl.server.start_server(
+            server_address=args.address,
+            config=fl.server.ServerConfig(num_rounds=args.rounds),
+            strategy=strategy,
+        )
+    else:
+        fl.server.start_server(
+            server_address=args.address,
+            server=server_impl,
+            config=fl.server.ServerConfig(num_rounds=args.rounds),
+        )
 
 if __name__ == "__main__":
     main() 

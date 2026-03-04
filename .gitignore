@@ -32,3 +32,5 @@ data/
 Thumbs.db 
 
 femnist/data_partitions_speech_commands/
+
+fedllm/

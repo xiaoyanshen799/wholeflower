@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/logs/comm_times.csv"
+csv_file = "/home/xiaoyan/wholeflower/logs/cifar100.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -17,7 +17,7 @@ df = pd.read_csv(csv_file)
 client_durations = defaultdict(list)
 client_colors = {}
 empirical_cdfs = {}
-
+client_num_examples = {}
 MAX_DURATION = 430.0
 
 
@@ -29,6 +29,8 @@ for _, row in df.iterrows():
     round_time = row["client_train_s"]  # 任务完成时长
     # round_time = row["client_train_s"] 
     client_durations[client_id].append({"duration": round_time})  # 存储时长
+    if client_id not in client_num_examples:
+        client_num_examples[client_id] = row["num_examples"]
 
 
 from scipy.stats import lognorm, weibull_min, t
@@ -69,6 +71,8 @@ for color, (client, records) in zip(colors, client_durations.items()):
         for r in records
         if "duration" in r and r["duration"] <= MAX_DURATION
     ]
+    num_examples = client_num_examples.get(client, 0)
+
     durations.sort()
     if not durations:
         continue
@@ -125,7 +129,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
         # print("Weibull:",   "SSE=", sse_weib, "AIC=", aic_weib)
         # print("LogNormal:","SSE=", sse_logn, "AIC=", aic_logn)
         theta_hat, k_hat = popt
-        print(f"[Logistic Fit] Client {client} => theta = {theta_hat:.4f}, k = {k_hat:.4f}")
+        print(f"[Logistic Fit] Client {client}  num_examples {num_examples} => theta = {theta_hat:.4f}, k = {k_hat:.4f}")
 
         # 存储到 client_params 里
         client_params[client] = (theta_hat, k_hat)

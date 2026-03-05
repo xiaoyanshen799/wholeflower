@@ -32,3 +32,4 @@ femnist/data
 femnist/data_partitions_speech_commands/raw
 venv_ixia/
 venv_ixi/
+fedllm/

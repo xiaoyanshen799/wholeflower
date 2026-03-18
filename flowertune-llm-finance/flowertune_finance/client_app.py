@@ -1,14 +1,17 @@
 """flowertune-finance: A Flower / FlowerTune app."""
 
+import json
 import os
-import warnings
 import time
+import warnings
+from dataclasses import dataclass, field
 
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 from flwr.common.config import unflatten_dict
 from omegaconf import DictConfig
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
+import torch
 from transformers import TrainingArguments
 from trl import SFTTrainer
 
@@ -31,6 +34,82 @@ os.environ["RAY_DISABLE_DOCKER_CPU_WARNING"] = "1"
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
+@dataclass
+class BatchTraceRecorder:
+    """Collect which samples and how many tokens were consumed in local training."""
+
+    step_sample_indices: list[list[int]] = field(default_factory=list)
+    step_input_tokens: list[int] = field(default_factory=list)
+    step_target_tokens: list[int] = field(default_factory=list)
+
+    def record(
+        self,
+        sample_indices: list[int],
+        input_tokens: int,
+        target_tokens: int,
+    ) -> None:
+        self.step_sample_indices.append(sample_indices)
+        self.step_input_tokens.append(input_tokens)
+        self.step_target_tokens.append(target_tokens)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(self.step_input_tokens)
+
+    @property
+    def total_target_tokens(self) -> int:
+        return sum(self.step_target_tokens)
+
+
+class TraceAnnotatingCollator:
+    """Wrap the training data collator and attach batch trace metadata."""
+
+    _MODEL_KEYS = {
+        "input_ids",
+        "attention_mask",
+        "labels",
+        "token_type_ids",
+        "special_tokens_mask",
+    }
+
+    def __init__(self, base_collator):
+        self.base_collator = base_collator
+
+    def __call__(self, features):
+        sample_indices = [int(feature["sample_idx"]) for feature in features]
+        input_tokens = sum(len(feature["input_ids"]) for feature in features)
+        sanitized_features = [
+            {key: value for key, value in feature.items() if key in self._MODEL_KEYS}
+            for feature in features
+        ]
+        batch = self.base_collator(sanitized_features)
+        target_tokens = int((batch["labels"] != -100).sum().item())
+        batch["trace_sample_idx"] = torch.tensor(sample_indices, dtype=torch.int64)
+        batch["trace_input_tokens"] = torch.tensor(input_tokens, dtype=torch.int64)
+        batch["trace_target_tokens"] = torch.tensor(target_tokens, dtype=torch.int64)
+        return batch
+
+
+class TracingSFTTrainer(SFTTrainer):
+    """SFTTrainer that records only batches actually consumed by training_step."""
+
+    def __init__(self, *args, trace_recorder: BatchTraceRecorder, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trace_recorder = trace_recorder
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        sample_indices = inputs.pop("trace_sample_idx", None)
+        input_tokens = inputs.pop("trace_input_tokens", None)
+        target_tokens = inputs.pop("trace_target_tokens", None)
+        if sample_indices is not None and input_tokens is not None and target_tokens is not None:
+            self.trace_recorder.record(
+                sample_indices.detach().cpu().tolist(),
+                int(input_tokens.item()),
+                int(target_tokens.item()),
+            )
+        return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+
 # Flower ClientApp
 app = ClientApp()
 
@@ -39,14 +118,21 @@ app = ClientApp()
 def train(msg: Message, context: Context):
     """Train the model on local data."""
     # Parse config
+    server_round = int(msg.content["config"]["server-round"])
     partition_id = context.node_config["partition-id"]
     num_partitions = context.node_config["num-partitions"]
     num_rounds = context.run_config["num-server-rounds"]
     cfg = DictConfig(replace_keys(unflatten_dict(context.run_config)))
     training_arguments = TrainingArguments(**cfg.train.training_arguments)
+    training_arguments.remove_unused_columns = False
+    base_seed = int(training_arguments.seed)
+    round_seed = base_seed + server_round - 1
+    # Keep the partition fixed but change the sampling order each round.
+    training_arguments.seed = round_seed
+    training_arguments.data_seed = round_seed
 
     # Let's get the client partition
-    trainset = load_data(partition_id, 500, cfg.static.dataset.name)
+    trainset = load_data(partition_id, num_partitions, cfg.static.dataset.name)
     (
         tokenizer,
         data_collator,
@@ -60,7 +146,7 @@ def train(msg: Message, context: Context):
 
     # Set learning rate for current round
     new_lr = cosine_annealing(
-        msg.content["config"]["server-round"],
+        server_round,
         num_rounds,
         cfg.train.learning_rate_max,
         cfg.train.learning_rate_min,
@@ -68,21 +154,36 @@ def train(msg: Message, context: Context):
 
     training_arguments.learning_rate = new_lr
     training_arguments.output_dir = msg.content["config"]["save_path"]
+    trace_recorder = BatchTraceRecorder()
+    trace_collator = TraceAnnotatingCollator(data_collator)
 
     # Construct trainer
-    trainer = SFTTrainer(
+    trainer = TracingSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_arguments,
         max_seq_length=cfg.train.seq_length,
         train_dataset=trainset,
         formatting_func=formatting_prompts_func,
-        data_collator=data_collator,
+        data_collator=trace_collator,
+        trace_recorder=trace_recorder,
     )
 
     # Do local training
     results = trainer.train()
     t_local_round_s = time.perf_counter() - local_round_start
+    trace_payload = {
+        "server_round": server_round,
+        "partition_id": int(partition_id),
+        "round_seed": round_seed,
+        "num_steps_traced": len(trace_recorder.step_sample_indices),
+        "total_input_tokens": trace_recorder.total_input_tokens,
+        "total_target_tokens": trace_recorder.total_target_tokens,
+        "step_input_tokens": trace_recorder.step_input_tokens,
+        "step_target_tokens": trace_recorder.step_target_tokens,
+        "step_sample_indices": trace_recorder.step_sample_indices,
+    }
+    print(f"ROUND_BATCH_TRACE {json.dumps(trace_payload, separators=(',', ':'))}")
 
     # Construct and return reply Message
     model_record = ArrayRecord(get_peft_model_state_dict(model))
@@ -90,6 +191,9 @@ def train(msg: Message, context: Context):
         "train_loss": results.training_loss,
         "num-examples": len(trainset),
         "t_local_round_s": t_local_round_s,
+        "train_total_input_tokens": trace_recorder.total_input_tokens,
+        "train_total_target_tokens": trace_recorder.total_target_tokens,
+        "train_num_steps_traced": len(trace_recorder.step_sample_indices),
     }
     metric_record = MetricRecord(metrics)
     content = RecordDict({"arrays": model_record, "metrics": metric_record})

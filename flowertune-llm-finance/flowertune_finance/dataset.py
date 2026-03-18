@@ -60,6 +60,13 @@ def reformat(dataset, llm_task):
     return dataset
 
 
+def add_sample_indices(dataset):
+    """Attach a stable sample index to each row in the current partition."""
+    if "sample_idx" in dataset.column_names:
+        return dataset
+    return dataset.add_column("sample_idx", list(range(len(dataset))))
+
+
 def load_data(partition_id: int, num_partitions: int, dataset_name: str):
     """Load partition data."""
     # Only initialize `FederatedDataset` once
@@ -72,6 +79,7 @@ def load_data(partition_id: int, num_partitions: int, dataset_name: str):
         )
     client_trainset = FDS.load_partition(partition_id, "train")
     client_trainset = reformat(client_trainset, llm_task="finance")
+    client_trainset = add_sample_indices(client_trainset)
     return client_trainset
 
 

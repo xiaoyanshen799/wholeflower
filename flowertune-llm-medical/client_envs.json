@@ -1,0 +1,18 @@
+{
+  "_comment": "Use * for defaults applied to every client, then override by client id.",
+  "*": {
+    "TOKENIZERS_PARALLELISM": "true"
+  },
+  "0": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "22.5"
+  },
+  "1": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "30"
+  },
+  "2": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "43"
+  }
+}

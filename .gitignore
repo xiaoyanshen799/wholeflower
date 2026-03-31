@@ -33,3 +33,17 @@ femnist/data_partitions_speech_commands/raw
 venv_ixia/
 venv_ixi/
 fedllm/
+.flower-process-runtime/
+flowertune-llm-code/.flower-process-runtime/
+flowertune-llm-medical/.flower-process-runtime/
+flowertune-llm-general-nlp/.flower-process-runtime/
+flowertune-llm-finance/flowertune-llm-finance/.flower-process-runtime/
+flowertune-llm-code/results/
+flowertune-llm-medical/results/
+flowertune-llm-general-nlp/results/
+flowertune-llm-finance/flowertune-llm-finance/results/
+flowertune-llm-finance/results/
+flowertune-llm-finance/exp_logs/
+
+data_partitions_cifar100/
+femnist/data_partitions_cifar10/

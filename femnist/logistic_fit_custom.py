@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/fedavgm/logs/comm_times.csv"
+csv_file = "/home/xiaoyan/wholeflower/flowertune-llm-medical/.flower-process-runtime/20260326_002840/logs/output.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.7:48528"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -33,8 +33,8 @@ for _, row in df.iterrows():
     client_id = str(row["client_id"])  # 客户端ID
     # round_time = row["server_to_client_time"] + row["client_to_server_time"]    # 任务完成时长
     #round_time = row["computing_time"]  
-    round_time = row["client_train_s"] + row["server_to_client_ms"]/1000+ row["client_to_server_ms"]/1000 # 任务完成时长
-    # round_time = row["client_train_s"] 
+    # round_time = row["client_train_s"] + row["server_to_client_ms"]/1000+ row["client_to_server_ms"]/1000 # 任务完成时长
+    round_time = row["duration"] 
     client_durations[client_id].append({"duration": round_time})  # 存储时长
 
 

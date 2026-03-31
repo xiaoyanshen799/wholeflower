@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/ubuntu/wholeflower/femnist/logs/stackoverflow_60.csv"
+csv_file = "/home/xiaoyan/wholeflower/flowertune-llm-medical/.flower-process-runtime/20260326_002840/logs/output.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -24,11 +24,11 @@ MAX_DURATION = 1000.0
 
 # 从 CSV 中提取客户端时长信息
 for _, row in df.iterrows():
-    client_id = str(row["client_id"])  # 客户端ID
+    client_id = str(row["num_examples"])  # 客户端ID
     # round_time = row["server_to_client_time"] + row["client_to_server_time"]    # 任务完成时长
     #round_time = row["computing_time"]  
-    round_time = row["client_train_s"]  # 任务完成时长
-    # round_time = row["client_train_s"] 
+    #round_time = row["client_train_s"]  # 任务完成时长
+    round_time = row["duration"]  # 任务完成时长
     client_durations[client_id].append({"duration": round_time})  # 存储时长
     if client_id not in client_num_examples:
         client_num_examples[client_id] = row["num_examples"]
@@ -351,8 +351,9 @@ else:
     t_grid = np.array([])
     prod_fixed = np.array([])
 
-df["_duration"] = df["client_train_s"] + df["client_to_server_ms"] / 1000.0 + df["server_to_client_ms"] / 1000.0
+# df["_duration"] = df["client_train_s"] + df["client_to_server_ms"] / 1000.0 + df["server_to_client_ms"] / 1000.0
 
+df["_duration"] = df["duration"]
 # 尝试自动识别“轮次”的列名
 _round_candidates = ["round", "server_round", "round_idx", "global_round", "comm_round", "epoch", "iteration"]
 _round_col = next((c for c in _round_candidates if c in df.columns), None)

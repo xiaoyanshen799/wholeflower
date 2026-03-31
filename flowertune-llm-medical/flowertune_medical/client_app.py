@@ -1,0 +1,146 @@
+"""flowertune-medical: A Flower / FlowerTune app."""
+
+import os
+import warnings
+import time
+
+from flwr.app import ArrayRecord, ConfigRecord, Context, Message, MetricRecord, RecordDict
+from flwr.clientapp import ClientApp
+from flwr.common.config import unflatten_dict
+from omegaconf import DictConfig
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
+from transformers import TrainingArguments
+from trl import SFTTrainer
+
+from flowertune_medical.dataset import (
+    get_tokenizer_and_data_collator_and_propt_formatting,
+    load_data,
+    replace_keys,
+)
+from flowertune_medical.models import cosine_annealing, get_model
+
+# Avoid warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["RAY_DISABLE_DOCKER_CPU_WARNING"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# Avoid warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["RAY_DISABLE_DOCKER_CPU_WARNING"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning)
+
+class TokenTracingSFTTrainer(SFTTrainer):
+    """SFTTrainer that tracks input tokens actually consumed during training."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_input_tokens = 0
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            self.total_input_tokens += int(attention_mask.sum().item())
+        return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+
+# Flower ClientApp
+app = ClientApp()
+
+
+@app.train()
+def train(msg: Message, context: Context):
+    """Train the model on local data."""
+    # Parse config
+    server_round = int(msg.content["config"]["server-round"])
+    partition_id = context.node_config["partition-id"]
+    num_partitions = context.node_config["num-partitions"]
+    num_rounds = context.run_config["num-server-rounds"]
+    cfg = DictConfig(replace_keys(unflatten_dict(context.run_config)))
+    training_arguments = TrainingArguments(**cfg.train.training_arguments)
+    use_dynamic_data_seed = cfg.train.get("dynamic_data_seed", False)
+
+    # Let's get the client partition
+    trainset = load_data(
+        partition_id,
+        num_partitions,
+        cfg.static.dataset.name,
+        cfg.get("partitioning", {}),
+    )
+    if use_dynamic_data_seed:
+        base_seed = int(
+            training_arguments.data_seed
+            if training_arguments.data_seed is not None
+            else training_arguments.seed
+        )
+        training_arguments.data_seed = base_seed + server_round - 1
+    else:
+        samples_per_round = (
+            training_arguments.per_device_train_batch_size
+            * training_arguments.gradient_accumulation_steps
+            * training_arguments.max_steps
+        )
+        if samples_per_round > 0 and len(trainset) > 0:
+            start = ((server_round - 1) * samples_per_round) % len(trainset)
+            end = start + samples_per_round
+            if end <= len(trainset):
+                indices = list(range(start, end))
+            else:
+                indices = list(range(start, len(trainset))) + list(
+                    range(0, end % len(trainset))
+                )
+            trainset = trainset.select(indices)
+    (
+        tokenizer,
+        data_collator,
+        formatting_prompts_func,
+    ) = get_tokenizer_and_data_collator_and_propt_formatting(cfg.model.name)
+
+    # Load the model and initialize it with the received weights
+    model = get_model(cfg.model)
+    local_round_start = time.perf_counter()
+    set_peft_model_state_dict(model, msg.content["arrays"].to_torch_state_dict())
+
+    # Set learning rate for current round
+    new_lr = cosine_annealing(
+        msg.content["config"]["server-round"],
+        num_rounds,
+        cfg.train.learning_rate_max,
+        cfg.train.learning_rate_min,
+    )
+
+    training_arguments.learning_rate = new_lr
+    training_arguments.output_dir = msg.content["config"]["save_path"]
+
+    # Construct trainer
+    trainer = TokenTracingSFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_arguments,
+        max_seq_length=cfg.train.seq_length,
+        train_dataset=trainset,
+        formatting_func=formatting_prompts_func,
+        data_collator=data_collator,
+    )
+
+    # Do local training
+    results = trainer.train()
+    t_local_round_s = time.perf_counter() - local_round_start
+
+    # Construct and return reply Message
+    model_record = ArrayRecord(get_peft_model_state_dict(model))
+    metrics = {
+        "train_loss": results.training_loss,
+        "t_local_round_s": t_local_round_s,
+        "num-examples": len(trainset),
+        "train_total_input_tokens": trainer.total_input_tokens,
+    }
+    train_runtime = results.metrics.get("train_runtime")
+    if train_runtime is not None:
+        metrics["train_runtime"] = float(train_runtime)
+    metric_record = MetricRecord(metrics)
+    client_info = ConfigRecord({"partition_id": int(partition_id)})
+    content = RecordDict(
+        {"arrays": model_record, "metrics": metric_record, "client_info": client_info}
+    )
+    return Message(content=content, reply_to=msg)

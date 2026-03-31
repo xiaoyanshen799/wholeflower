@@ -1,0 +1,7 @@
+results/
+logs/
+.flower-process-runtime/
+__pycache__/
+*.log
+*.png
+*.sqlite

@@ -385,8 +385,8 @@ def main() -> None:
         print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
         params = client.get_parameters({})
         # Fall back to sensible defaults if overrides are not provided.
-        epochs = args.epochs if args.epochs is not None else 1
-        batch_size = args.batch_size if args.batch_size is not None else 64
+        epochs = args.epochs if args.epochs is not None else 5
+        batch_size = args.batch_size if args.batch_size is not None else 32
         total_time = 0.0
         for r in range(1, rounds + 1):
             _, _, metrics = client.fit(

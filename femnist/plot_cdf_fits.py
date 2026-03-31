@@ -29,6 +29,67 @@ def model_client(theta_i: float, k_i: float):
     return f
 
 
+def fit_client_theta_k(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    theta0 = float(np.median(x))
+    k0 = float((np.percentile(x, 75) - np.percentile(x, 25)) / 4.0)
+    p0 = [theta0, max(k0, 0.1)]
+    bounds = ([float(x.min()), 0.05], [float(x.max()), 300.0])
+    popt, _ = curve_fit(
+        lambda t, theta_i, k_i: model_client(theta_i, k_i)(t),
+        x,
+        y,
+        p0=p0,
+        bounds=bounds,
+        maxfev=20000,
+    )
+    return float(popt[0]), float(popt[1])
+
+
+def parse_error_stats(spec: str) -> list[tuple[str, float | None]]:
+    stats: list[tuple[str, float | None]] = []
+    for raw in spec.split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token == "mean":
+            stats.append(("mean", None))
+            continue
+        if token.startswith("p"):
+            token = token[1:]
+        if token.endswith("%"):
+            token = token[:-1]
+        value = float(token)
+        if value > 1.0:
+            value /= 100.0
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"Invalid quantile: {raw}")
+        label = f"p{int(round(value * 100))}" if np.isclose(value * 100, round(value * 100)) else f"p{value:g}"
+        stats.append((label, value))
+    if not stats:
+        raise ValueError("No valid error stats requested.")
+    return stats
+
+
+def fixed_model_quantile(theta: float, a_theta: float, lam_total: float, p: float) -> float:
+    if lam_total <= 0.0:
+        raise ValueError("lam_total must be positive.")
+    inner = p ** (-1.0 / lam_total) - 1.0
+    return float(theta - a_theta * np.log(inner))
+
+
+def fixed_model_mean(theta: float, a_theta: float, lam_total: float) -> float:
+    upper = fixed_model_quantile(theta, a_theta, lam_total, 0.9999)
+    t_eval = np.linspace(0.0, max(upper, theta + 10.0 * a_theta), 5000)
+    cdf = model_fixed(theta, a_theta)(t_eval, lam_total)
+    return float(np.trapz(1.0 - cdf, t_eval))
+
+
+def relative_error(predicted: float, actual: float) -> float:
+    if np.isclose(actual, 0.0):
+        return float("nan")
+    return float(abs(predicted - actual) / abs(actual))
+
+
 def sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
 
@@ -39,7 +100,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--csv",
-        default="/home/ubuntu/wholeflower/logs/comm_times.csv",
+        default="/home/xiaoyan/wholeflower/flowertune-llm-medical/.flower-process-runtime/20260326_002840/logs/output.csv",
         type=Path,
         help="Input comm_times.csv",
     )
@@ -64,14 +125,14 @@ def main() -> None:
     parser.add_argument(
         "--k-intercept",
         type=float,
-        default=0.0911,
+        default=2,
         help="Intercept for k(theta)=k_slope*theta+k_intercept.",
     )
     parser.add_argument(
         "--theta-k-csv",
-        default="/home/ubuntu/wholeflower/femnist/mnist_cpu_theta.csv",
         type=Path,
-        help="CSV with columns id,theta,k (id is num_examples_train).",
+        default=None,
+        help="Optional CSV with columns id,theta,k (id is num_examples_train).",
     )
     parser.add_argument(
         "--time-col",
@@ -80,7 +141,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--client-col",
-        default="client_id",
+        default="num_examples",
         help="Column name for client id.",
     )
     parser.add_argument(
@@ -112,19 +173,35 @@ def main() -> None:
         default=Path("logs/lambda_fits.csv"),
         help="Output CSV for lambda fits.",
     )
+    parser.add_argument(
+        "--error-stats",
+        default="p90,p95,mean",
+        help="Comma-separated stats for fixed-theta overall errors, e.g. p90,p95,mean.",
+    )
+    parser.add_argument(
+        "--error-out-csv",
+        type=Path,
+        default=Path("logs/fixed_theta_error_summary.csv"),
+        help="Output CSV for fixed-theta overall error summary.",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
     if args.time_col not in df.columns or args.client_col not in df.columns:
         raise SystemExit("Missing required columns in comm_times.csv.")
 
-    theta_k = pd.read_csv(args.theta_k_csv)
-    if not {"id", "theta", "k"}.issubset(theta_k.columns):
-        raise SystemExit("theta_k_csv must contain columns: id, theta, k")
-    theta_k_map = {
-        int(row["id"]): (float(row["theta"]), float(row["k"]))
-        for _, row in theta_k.iterrows()
-    }
+    theta_k_map = {}
+    if args.theta_k_csv is not None:
+        theta_k = pd.read_csv(args.theta_k_csv)
+        if not {"id", "theta", "k"}.issubset(theta_k.columns):
+            raise SystemExit("theta_k_csv must contain columns: id, theta, k")
+        theta_k_map = {
+            int(row["id"]): (float(row["theta"]), float(row["k"]))
+            for _, row in theta_k.iterrows()
+        }
+        print(f"Loaded theta/k mapping from {args.theta_k_csv}")
+    else:
+        print("No theta/k mapping CSV provided; fitting per-client theta/k from data.")
 
     a_theta = args.a_theta
     if a_theta is None:
@@ -137,6 +214,7 @@ def main() -> None:
 
     rows = []
     lam_values = []
+    empirical_client_cdfs: dict[object, tuple[np.ndarray, np.ndarray]] = {}
     all_times = df[args.time_col].to_numpy(dtype=float)
     all_times = all_times[np.isfinite(all_times)]
     if args.max_time is not None:
@@ -153,6 +231,7 @@ def main() -> None:
             continue
 
         x, y = make_empirical_cdf(times)
+        empirical_client_cdfs[client] = (x, y)
 
         # Fit lambda for model1; emphasize right half of the CDF (larger t / higher y)
         try:
@@ -180,8 +259,17 @@ def main() -> None:
                 num_examples = None
 
         theta_i = k_i = None
-        if num_examples is not None and num_examples in theta_k_map:
-            theta_i, k_i = theta_k_map[num_examples]
+        theta_k_source = "none"
+        if theta_k_map:
+            if num_examples is not None and num_examples in theta_k_map:
+                theta_i, k_i = theta_k_map[num_examples]
+                theta_k_source = "csv"
+        else:
+            try:
+                theta_i, k_i = fit_client_theta_k(x, y)
+                theta_k_source = "fit"
+            except Exception:
+                theta_i = k_i = None
 
         rows.append(
             {
@@ -190,6 +278,9 @@ def main() -> None:
                 "lambda": lam,
                 "theta_i": theta_i,
                 "k_i": k_i,
+                "theta_k_source": theta_k_source,
+                "time_min": float(x.min()),
+                "time_max": float(x.max()),
                 "n": len(times),
             }
         )
@@ -199,6 +290,16 @@ def main() -> None:
             f"[Lambda Fit] client={client} num_examples={num_examples} "
             f"lambda={lam:.6f} n={len(times)}"
         )
+        if theta_i is not None and k_i is not None:
+            print(
+                f"[Theta/K {theta_k_source}] client={client} num_examples={num_examples} "
+                f"theta={theta_i:.6f} k={k_i:.6f}"
+            )
+        else:
+            print(
+                f"[Theta/K {theta_k_source}] client={client} num_examples={num_examples} "
+                "theta/k unavailable"
+            )
 
         # Plot per-client
         plt.figure(figsize=(7, 5))
@@ -262,9 +363,68 @@ def main() -> None:
         x_max = y_max = None
 
     plt.figure(figsize=(8, 6))
-    plt.plot(t_grid, prod_model1, "r--", linewidth=2, label="Product CDF (fixed θ,λ)")
+    client_labels_in_legend = len(rows) <= 12
+    colors = plt.get_cmap("tab10")(np.linspace(0.0, 1.0, max(len(rows), 1)))
+    for idx, r in enumerate(rows):
+        client = r["client_id"]
+        theta_i = r["theta_i"]
+        k_i = r["k_i"]
+        lam = r["lambda"]
+        client_mask = t_grid >= float(r["time_min"])
+        x_emp, y_emp = empirical_client_cdfs[client]
+        color = colors[idx % len(colors)]
+        point_label = f"Client {client} empirical" if client_labels_in_legend else None
+        plt.plot(
+            x_emp,
+            y_emp,
+            "o",
+            markersize=3,
+            alpha=0.5,
+            color=color,
+            label=point_label,
+        )
+        if theta_i is not None and k_i is not None and k_i > 0:
+            y_client = model_client(theta_i, k_i)(t_grid[client_mask])
+            label = f"Client {client} fit" if client_labels_in_legend else None
+            plt.plot(
+                t_grid[client_mask],
+                y_client,
+                linewidth=1.0,
+                alpha=0.35,
+                color=color,
+                label=label,
+            )
+        elif np.isfinite(lam):
+            y_client = model1(t_grid[client_mask], lam)
+            label = (
+                f"Client {client} fixed θ,λ" if client_labels_in_legend else None
+            )
+            plt.plot(
+                t_grid[client_mask],
+                y_client,
+                linewidth=1.0,
+                alpha=0.25,
+                color=color,
+                label=label,
+            )
+
+    product_start = max(float(r["time_min"]) for r in rows) if rows else float(t_grid.min())
+    product_mask = t_grid >= product_start
+    plt.plot(
+        t_grid[product_mask],
+        prod_model1[product_mask],
+        "r--",
+        linewidth=2,
+        label="Product CDF (fixed θ,λ)",
+    )
     if any_model2:
-        plt.plot(t_grid, prod_model2, "g-.", linewidth=2, label="Product CDF (per-client θ,k)")
+        plt.plot(
+            t_grid[product_mask],
+            prod_model2[product_mask],
+            "g-.",
+            linewidth=2,
+            label="Product CDF (per-client θ,k)",
+        )
     if x_max is not None:
         plt.plot(x_max, y_max, "ko", markersize=3, label="Empirical max per round")
     plt.xlabel("t")
@@ -275,6 +435,45 @@ def main() -> None:
     plt.tight_layout()
     plt.savefig(out_dir / "overall_cdfs.png", dpi=150)
     plt.close()
+
+    if "server_round" in df.columns and x_max is not None and len(max_per_round) > 0:
+        error_rows = []
+        lam_total = float(np.nansum([r["lambda"] for r in rows if np.isfinite(r["lambda"])]))
+        requested_stats = parse_error_stats(args.error_stats)
+        for label, quantile in requested_stats:
+            if label == "mean":
+                actual_value = float(np.mean(max_per_round))
+                predicted_value = fixed_model_mean(args.theta_target, a_theta, lam_total)
+            else:
+                assert quantile is not None
+                actual_value = float(np.quantile(max_per_round, quantile))
+                predicted_value = fixed_model_quantile(
+                    args.theta_target,
+                    a_theta,
+                    lam_total,
+                    quantile,
+                )
+            abs_err = float(abs(predicted_value - actual_value))
+            rel_err = relative_error(predicted_value, actual_value)
+            error_rows.append(
+                {
+                    "stat": label,
+                    "actual": actual_value,
+                    "predicted_fixed_theta_lambda": predicted_value,
+                    "abs_err": abs_err,
+                    "rel_err": rel_err,
+                }
+            )
+            print(
+                f"[Fixed Theta Error] {label}: actual={actual_value:.6f} "
+                f"predicted={predicted_value:.6f} abs_err={abs_err:.6f} "
+                f"rel_err={rel_err:.6f}"
+            )
+        args.error_out_csv.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(error_rows).to_csv(args.error_out_csv, index=False)
+        print(f"Saved fixed-theta error summary to {args.error_out_csv}")
+    else:
+        print("Skipped fixed-theta error summary because server_round data is unavailable.")
 
     print(f"Saved per-client plots to {client_dir}")
     print(f"Saved overall plot to {out_dir / 'overall_cdfs.png'}")

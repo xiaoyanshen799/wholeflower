@@ -7,11 +7,18 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/ubuntu/wholeflower/femnist/logs/stackoverflow_60.csv"
-EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
-# 读取 CSV 文件
+csv_file = "/home/xiaoyan/wholeflower/femnist/speech_comm/trytarget_dynamic.csv"
+EXCLUDED_CLIENTS = {
+    "ipv4:127.0.0.1:40954"
+}
+
 df = pd.read_csv(csv_file)
-# df = df[df["client_id"].astype(str) != EXCLUDED_CLIENT]
+df = df[~df["client_id"].astype(str).isin(EXCLUDED_CLIENTS)]
+
+df["client_train_s"] = pd.to_numeric(df["client_train_s"], errors="coerce")
+for col in ["client_to_server_ms", "server_to_client_ms"]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
 # 数据存储
 client_durations = defaultdict(list)
@@ -19,7 +26,19 @@ client_num_examples = {}
 client_colors = {}
 empirical_cdfs = {}
 
-MAX_DURATION = 1000.0
+MAX_DURATION = 100.0
+MIN_DURATION = 70.0
+
+
+def is_valid_duration(duration):
+    return MIN_DURATION <= duration <= MAX_DURATION
+
+
+def safe_theta_bounds(x_data, theta0):
+    x_min = float(np.min(x_data))
+    x_max = float(np.max(x_data))
+    eps = max(1e-6, 1e-6 * max(1.0, abs(x_min), abs(x_max), abs(float(theta0))))
+    return x_min - eps, x_max + eps
 
 
 # 从 CSV 中提取客户端时长信息
@@ -55,6 +74,10 @@ def aic(n, sse, num_params):
 # 创建图形
 plt.figure(figsize=(16, 8))
 colors = plt.get_cmap("tab20")(np.linspace(0, 1, len(client_durations)))
+valid_train_mask = df["client_train_s"].apply(
+    lambda value: pd.notna(value) and is_valid_duration(float(value))
+)
+filtered_df = df.loc[valid_train_mask].copy()
 
 # 用于存储每个客户端的 (theta, k) 参数
 client_params = {}
@@ -70,7 +93,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
     durations = [
         r["duration"]
         for r in records
-        if "duration" in r and r["duration"] <= MAX_DURATION
+        if "duration" in r and is_valid_duration(r["duration"])
     ]
     num_examples = client_num_examples.get(client, 0)
     durations.sort()
@@ -109,13 +132,27 @@ for color, (client, records) in zip(colors, client_durations.items()):
         theta0 = np.median(x_data)
         k0 = (np.percentile(x_data, 75) - np.percentile(x_data, 25)) / 4  # IQR/4≈σ
         p0 = [theta0, max(k0, 0.1)]
-
-        bounds = ([min(x_data), 0.05],     # k ≥ 0.05 s
-                [max(x_data), 1000.0])
-
-        popt, _ = curve_fit(logistic_cdf, x_data, y_data,
-                            p0=p0, bounds=bounds,
-                            maxfev=20000, loss='soft_l1')
+        unique_count = len(np.unique(x_data))
+        if unique_count < 2:
+            theta_hat = float(x_data[0])
+            k_hat = max(float(k0), 0.1)
+            print(
+                f"[Logistic Fit] Client {client} has constant durations; "
+                f"using fallback theta = {theta_hat:.4f}, k = {k_hat:.4f}"
+            )
+        else:
+            theta_lower, theta_upper = safe_theta_bounds(x_data, theta0)
+            bounds = ([theta_lower, 0.05], [theta_upper, 1000.0])  # k ≥ 0.05 s
+            popt, _ = curve_fit(
+                logistic_cdf,
+                x_data,
+                y_data,
+                p0=p0,
+                bounds=bounds,
+                maxfev=20000,
+                loss='soft_l1',
+            )
+            theta_hat, k_hat = popt
         # n = len(x_data)
         # sse_log  = sse(y_data, logistic_cdf(x_data, *p_log))
         # sse_weib = sse(y_data, weibull_cdf(x_data, *p_weib))
@@ -128,7 +165,6 @@ for color, (client, records) in zip(colors, client_durations.items()):
         # print("Logistic:",  "SSE=", sse_log,  "AIC=", aic_log)
         # print("Weibull:",   "SSE=", sse_weib, "AIC=", aic_weib)
         # print("LogNormal:","SSE=", sse_logn, "AIC=", aic_logn)
-        theta_hat, k_hat = popt
         print(f"[Logistic Fit] Client {client} num_examples {num_examples} => theta = {theta_hat:.4f}, k = {k_hat:.4f}")
 
         # 存储到 client_params 里
@@ -139,14 +175,14 @@ for color, (client, records) in zip(colors, client_durations.items()):
         y_fit = logistic_cdf(x_fit, theta_hat, k_hat)
 
         # 在图上绘制光滑的 Logistic 拟合曲线
-        plt.plot(
-            x_fit,
-            y_fit,
-            linestyle="-",
-            color=color,
-            linewidth=1.8,
-            label=f"client {client} logistic fit",
-        )
+        # plt.plot(
+        #     x_fit,
+        #     y_fit,
+        #     linestyle="-",
+        #     color=color,
+        #     linewidth=1.8,
+        #     label=f"client {client} logistic fit",
+        # )
 
         # Student-t Location-Scale 拟合
         try:
@@ -194,7 +230,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
             # )
         except Exception as weib_exc:  # noqa: BLE001
             print(f"[Weibull Fit] Client {client} failed: {weib_exc}")
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         print(f"Client {client} fitting failed: {e}")
         continue
 
@@ -260,7 +296,9 @@ def logistic_gen_cdf(t, gamma):
 gamma_params = {}
 
 for cid in client_params.keys():
-    times = np.array([r["duration"] for r in client_durations[cid] if r["duration"] <= MAX_DURATION])
+    times = np.array(
+        [r["duration"] for r in client_durations[cid] if is_valid_duration(r["duration"])]
+    )
     times.sort()
     if times.size == 0:
         continue
@@ -332,7 +370,7 @@ if all_durations:
     # (e) product of empirical CDF stair-steps  (optional)
     prod_empirical = np.ones_like(t_grid)
     for cid, recs in client_durations.items():
-        times = np.array([r["duration"] for r in recs if r["duration"] <= MAX_DURATION])
+        times = np.array([r["duration"] for r in recs if is_valid_duration(r["duration"])])
         times.sort()
         if times.size == 0:
             continue
@@ -343,7 +381,15 @@ if all_durations:
     # ------------------------------------------------------------------
     # 4)  Plot
     # ------------------------------------------------------------------
-    plt.plot(t_grid, prod_original, label="product of original logistic fits", lw=2, color='black')
+    # plt.plot(
+    #     t_grid,
+    #     prod_original,
+    #     label="product of original logistic fits",
+    #     lw=1.8,
+    #     color="black",
+    #     linestyle="--",
+    #     alpha=0.7,
+    # )
     # plt.plot(t_grid, prod_gamma, "-", label=f"product with k={K_FIXED}, γ-fitted", lw=2, color='red')
     # plt.plot(t_grid, prod_t, "-", label="product of t fits", lw=2, color='green')
     # plt.plot(t_grid, prod_weibull, "-", label="product of Weibull fits", lw=2, color='blue')
@@ -351,41 +397,47 @@ else:
     t_grid = np.array([])
     prod_fixed = np.array([])
 
-df["_duration"] = df["client_train_s"] + df["client_to_server_ms"] / 1000.0 + df["server_to_client_ms"] / 1000.0
+filtered_df["_duration"] = (
+    filtered_df["client_train_s"]
+    + filtered_df["client_to_server_ms"] / 1000.0
+    + filtered_df["server_to_client_ms"] / 1000.0
+)
 
 # 尝试自动识别“轮次”的列名
 _round_candidates = ["round", "server_round", "round_idx", "global_round", "comm_round", "epoch", "iteration"]
-_round_col = next((c for c in _round_candidates if c in df.columns), None)
+_round_col = next((c for c in _round_candidates if c in filtered_df.columns), None)
 
 if _round_col is not None:
-    # 每轮内先过滤掉 >35s 的，再取最大
+    # 只基于前面保留下来的点计算每轮时间，避免被排除的样本重新混进来。
     per_round_time = (
-        df.groupby(_round_col)["_duration"]
-        .apply(lambda x: x[x <= 430.0].max() if any(x <= 430.0) else np.nan)
+        filtered_df.groupby(_round_col)["_duration"]
+        .max()
         .dropna()
         .sort_index()
         .values
     )
-    print("max per-round time (≤430s):", per_round_time)
+    print("max per-round time (filtered):", per_round_time)
 
     if len(per_round_time) > 0:
-        # 画经验CDF
+        # 画完整的每轮经验CDF
         per_round_time_sorted = np.sort(per_round_time)
         per_round_cdf = np.arange(1, len(per_round_time_sorted) + 1) / float(len(per_round_time_sorted))
 
-        # plt.plot(
-        #     per_round_time_sorted,
-        #     per_round_cdf,
-        #     "-", linewidth=2.5,
-        #     label="Actual per-round max (≤35s)"
-        # )
+        plt.plot(
+            per_round_time_sorted,
+            per_round_cdf,
+            "-",
+            linewidth=2.5,
+            color="black",
+            label="Actual per-round max (filtered)",
+        )
 
 
 plt.xlabel("Time (s)")
 plt.ylabel("Cumulative Probability")
 plt.title("server to client")
 plt.grid(alpha=0.3)
-# plt.legend()
+plt.legend()
 plt.ylim(0, 1.1)
 # plt.xlim(left=25, right=35)
 plt.tight_layout()

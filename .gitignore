@@ -32,3 +32,9 @@ femnist/data
 femnist/data_partitions_speech_commands/raw
 venv_ixia/
 venv_ixi/
+
+fedllm/
+data_partitions_cifar100/
+femnist/data_partitions_cifar10/
+
+flowertune-llm-finance/exp_logs/    

@@ -174,7 +174,7 @@ def main() -> None:
     parser.add_argument("--data-dir", default="data_partitions1", help="Directory containing partition files")
     parser.add_argument(
         "--dataset",
-        default="cifar10",
+        default="femnist",
         choices=["cifar10", "mnist", "fmnist", "femnist", "shakespeare", "speech_commands", "stackoverflow"],
         help="Dataset name (controls preprocessing/model defaults)",
     )
@@ -470,7 +470,7 @@ def main() -> None:
         print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
         params = client.get_parameters({})
         # Fall back to sensible defaults if overrides are not provided.
-        epochs = args.epochs if args.epochs is not None else 1
+        epochs = args.epochs if args.epochs is not None else 10
         batch_size = args.batch_size if args.batch_size is not None else 10
         total_time = 0.0
         for r in range(1, rounds + 1):

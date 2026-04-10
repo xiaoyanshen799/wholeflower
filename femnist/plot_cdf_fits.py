@@ -23,6 +23,10 @@ def model_fixed(theta: float, a_theta: float):
     return f
 
 
+def logistic_cdf(t: np.ndarray, theta: float, k: float) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-(t - theta) / k))
+
+
 def model_client(theta_i: float, k_i: float):
     def f(t):
         return 1.0 / (1.0 + np.exp(-(t - theta_i) / k_i))
@@ -33,13 +37,23 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
 
 
+def parse_exclude_clients(values: list[str] | None) -> set[str]:
+    excluded: set[str] = set()
+    for raw in values or []:
+        for token in raw.split(","):
+            token = token.strip()
+            if token:
+                excluded.add(token)
+    return excluded
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Plot per-client CDF fits and overall product CDFs."
     )
     parser.add_argument(
         "--csv",
-        default="/home/ubuntu/wholeflower/logs/comm_times.csv",
+        default="/home/xiaoyan/wholeflower/femnist/logs/speech_commom_target_85_3.csv",
         type=Path,
         help="Input comm_times.csv",
     )
@@ -64,14 +78,8 @@ def main() -> None:
     parser.add_argument(
         "--k-intercept",
         type=float,
-        default=0.0911,
+        default=0.3,
         help="Intercept for k(theta)=k_slope*theta+k_intercept.",
-    )
-    parser.add_argument(
-        "--theta-k-csv",
-        default="/home/ubuntu/wholeflower/femnist/mnist_cpu_theta.csv",
-        type=Path,
-        help="CSV with columns id,theta,k (id is num_examples_train).",
     )
     parser.add_argument(
         "--time-col",
@@ -80,8 +88,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--client-col",
-        default="client_id",
-        help="Column name for client id.",
+        default="num_examples",
+        help="Column name used as the stable client identifier.",
     )
     parser.add_argument(
         "--num-examples-col",
@@ -112,19 +120,23 @@ def main() -> None:
         default=Path("logs/lambda_fits.csv"),
         help="Output CSV for lambda fits.",
     )
+    parser.add_argument(
+        "--exclude-client",
+        action="append",
+        default=None,
+        help="Client identifier(s) to skip. Repeat the flag or pass a comma-separated list.",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
     if args.time_col not in df.columns or args.client_col not in df.columns:
         raise SystemExit("Missing required columns in comm_times.csv.")
-
-    theta_k = pd.read_csv(args.theta_k_csv)
-    if not {"id", "theta", "k"}.issubset(theta_k.columns):
-        raise SystemExit("theta_k_csv must contain columns: id, theta, k")
-    theta_k_map = {
-        int(row["id"]): (float(row["theta"]), float(row["k"]))
-        for _, row in theta_k.iterrows()
-    }
+    excluded_clients = parse_exclude_clients(args.exclude_client)
+    if excluded_clients:
+        client_keys = df[args.client_col].astype(str).str.strip()
+        df = df.loc[~client_keys.isin(excluded_clients)].copy()
+    if df.empty:
+        raise SystemExit("No rows left in CSV after applying excluded clients.")
 
     a_theta = args.a_theta
     if a_theta is None:
@@ -137,6 +149,7 @@ def main() -> None:
 
     rows = []
     lam_values = []
+    client_plot_rows = []
     all_times = df[args.time_col].to_numpy(dtype=float)
     all_times = all_times[np.isfinite(all_times)]
     if args.max_time is not None:
@@ -145,6 +158,10 @@ def main() -> None:
         raise SystemExit("No valid times in CSV.")
 
     for client, sub in df.groupby(args.client_col):
+        client_str = str(client)
+        if client_str in excluded_clients:
+            continue
+
         times = sub[args.time_col].to_numpy(dtype=float)
         if args.max_time is not None:
             times = times[times <= args.max_time]
@@ -172,21 +189,33 @@ def main() -> None:
         except Exception:
             lam = float("nan")
 
-        num_examples = None
+        client_num_examples = None
         if args.num_examples_col in sub.columns:
             try:
-                num_examples = int(float(sub[args.num_examples_col].iloc[0]))
+                client_num_examples = int(float(sub[args.num_examples_col].iloc[0]))
             except Exception:
-                num_examples = None
+                client_num_examples = None
 
         theta_i = k_i = None
-        if num_examples is not None and num_examples in theta_k_map:
-            theta_i, k_i = theta_k_map[num_examples]
+        try:
+            theta0 = float(np.median(x))
+            k0 = float(max((np.percentile(x, 75) - np.percentile(x, 25)) / 4.0, 0.1))
+            popt, _ = curve_fit(
+                logistic_cdf,
+                x,
+                y,
+                p0=[theta0, k0],
+                bounds=([float(x.min()), 0.05], [float(x.max()), 1000.0]),
+                maxfev=20000,
+            )
+            theta_i, k_i = map(float, popt)
+        except Exception:
+            theta_i = k_i = None
 
         rows.append(
             {
                 "client_id": client,
-                "num_examples": num_examples,
+                "num_examples": client_num_examples,
                 "lambda": lam,
                 "theta_i": theta_i,
                 "k_i": k_i,
@@ -196,8 +225,19 @@ def main() -> None:
         if np.isfinite(lam):
             lam_values.append(lam)
         print(
-            f"[Lambda Fit] client={client} num_examples={num_examples} "
+            f"[Lambda Fit] client={client} num_examples={client_num_examples} "
             f"lambda={lam:.6f} n={len(times)}"
+        )
+
+        client_plot_rows.append(
+            {
+                "client": client,
+                "x": x,
+                "y": y,
+                "theta_i": theta_i,
+                "k_i": k_i,
+                "lambda": lam,
+            }
         )
 
         # Plot per-client
@@ -211,10 +251,9 @@ def main() -> None:
             plt.plot(x_grid, y1, "r--", linewidth=2, label=f"fixed θ,λ={lam:.3f}")
 
         # model2 curve
-        if theta_i is not None and k_i is not None and k_i > 0:
-            m2 = model_client(theta_i, k_i)
-            y2 = m2(x_grid)
-            plt.plot(x_grid, y2, "g-.", linewidth=2, label="per-client θ,k")
+        if np.isfinite(lam):
+            y_lam = model1(x_grid, lam)
+            plt.plot(x_grid, y_lam, "r--", linewidth=2, label=f"fixed θ,λ={lam:.3f}")
 
         plt.xlabel("t")
         plt.ylabel("CDF")
@@ -261,17 +300,45 @@ def main() -> None:
     else:
         x_max = y_max = None
 
-    plt.figure(figsize=(8, 6))
-    plt.plot(t_grid, prod_model1, "r--", linewidth=2, label="Product CDF (fixed θ,λ)")
-    if any_model2:
-        plt.plot(t_grid, prod_model2, "g-.", linewidth=2, label="Product CDF (per-client θ,k)")
+    plt.figure(figsize=(12, 8))
+    colours = plt.get_cmap("tab20")(np.linspace(0, 1, max(len(client_plot_rows), 1)))
+    for colour, plot_row in zip(colours, client_plot_rows):
+        client = plot_row["client"]
+        x = plot_row["x"]
+        y = plot_row["y"]
+        plt.plot(
+            x,
+            y,
+            "o",
+            markersize=2.5,
+            alpha=1,
+            color=colour,
+            label=f"{client} empirical",
+        )
+        lam = plot_row["lambda"]
+        if np.isfinite(lam):
+            plt.plot(
+                t_grid,
+                model1(t_grid, lam),
+                "--",
+                linewidth=1.5,
+                alpha=0.85,
+                color=colour,
+                label=f"{client} lam-fit",
+            )
+
+    plt.plot(t_grid, prod_model1, "r--", linewidth=2.5, label="Product CDF (fixed θ,λ)")
     if x_max is not None:
-        plt.plot(x_max, y_max, "ko", markersize=3, label="Empirical max per round")
+        plt.plot(x_max, y_max, "ko", markersize=3.5, label="Empirical max per round")
     plt.xlabel("t")
     plt.ylabel("CDF")
-    plt.title("Overall CDF comparison")
+    plt.title("Overall CDF comparison with per-client empirical points and λ fits")
     plt.grid(alpha=0.3)
-    plt.legend()
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if len(handles) <= 30:
+        plt.legend(fontsize=8, ncol=2)
+    else:
+        plt.legend(handles[-2:], labels[-2:], fontsize=9)
     plt.tight_layout()
     plt.savefig(out_dir / "overall_cdfs.png", dpi=150)
     plt.close()

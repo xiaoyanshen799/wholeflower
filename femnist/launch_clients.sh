@@ -36,11 +36,11 @@ CPU_ONLY=${CPU_ONLY:-}
 case "$PRESET" in
   default)
     DATASET=${DATASET:-speech_commands}
-    MODEL=${MODEL:-resnet34}
-    BATCH_SIZE=${BATCH_SIZE:-8}
+    MODEL=${MODEL:-speech_cnn_small}
+    BATCH_SIZE=${BATCH_SIZE:-32}
     LR=${LR:-0.001}
-    MPS_ENABLE=${MPS_ENABLE:-1}
-    CPU_ONLY=${CPU_ONLY:-0}
+    MPS_ENABLE=${MPS_ENABLE:-0}
+    CPU_ONLY=${CPU_ONLY:-1}
     ;;
   refl-cpu)
     DATASET=${DATASET:-cifar10}
@@ -85,7 +85,7 @@ SYSTEMD_MODE="system"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Optional: CSV mapping client_id -> new_cpu (fraction 0-1). If set, use per-client CPUQuota.
-CPU_MAP_CSV=${CPU_MAP_CSV:-"$PROJECT_DIR/../logs/client_num_examples.csv"}
+CPU_MAP_CSV=${CPU_MAP_CSV:-"$PROJECT_DIR/logs/client_num_examples.csv"}
 
 # 把 data_dir 变成绝对路径，避免工作目录不同导致找不到
 if [[ "$DATA_DIR" = /* ]]; then
@@ -265,7 +265,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
   cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
   "${SYSTEMD_RUN[@]}" \
-    -p CPUAccounting=yes -p CPUQuota="100%" -p CPUQuotaPeriodSec=20ms \
+    -p CPUAccounting=yes -p CPUQuota="$cpu_quota" -p CPUQuotaPeriodSec=20ms \
     --uid="$RUN_AS_USER" \
     --working-directory="$PROJECT_DIR" \
     "${ENV_VARS[@]}" \

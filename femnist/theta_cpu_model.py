@@ -7,10 +7,10 @@ import matplotlib.cm as cm
 # -------------------------------------------------
 # 1) load data
 # -------------------------------------------------
-df = pd.read_csv("/home/ubuntu/wholeflower/femnist/mnist_cpu_theta.csv")
+df = pd.read_csv("/home/xiaoyan/wholeflower/femnist/mnist_cpu_theta.csv")
 
 # anchor rows that every client has
-anchor_cpu = np.array([1.0,0.6,0.3])
+anchor_cpu = np.array([0.9,0.6,0.3])
 
 # percentages a% in (0,1) to generate extra points at c = 1 * a
 # Use small interval (e.g., 5%) and theta1 = theta0 / a
@@ -73,7 +73,7 @@ for i, (cid, sub) in enumerate(df.groupby("id"), start=0):
     #     p0=p0_k, bounds=(0, np.inf), maxfev=10_000)
 
     # ------ CPU that yields θ = 50 -----------------------------------------
-    target_theta = 40.0
+    target_theta = 86.61
     if a_th <= 0 or b_th == 0 or target_theta <= g_th:
         cpu_50 = np.nan
     else:

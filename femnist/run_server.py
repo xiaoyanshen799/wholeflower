@@ -55,6 +55,10 @@ def _is_cifar100(name: str) -> bool:
     return name.lower() in {"cifar100", "fed-cifar100", "fed_cifar100", "cifar100-resnet"}
 
 
+def _is_cifar10(name: str) -> bool:
+    return name.lower() in {"cifar", "cifar10", "cifar-10"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Flower server for FedAvg/FedAvgM experiments.")
     parser.add_argument(
@@ -70,13 +74,14 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default="resnet20",
-        choices=["cnn", "tf_example", "resnet20", "mobilenet_v2_075", "mobilenet_v2_100"],
+        choices=["cnn", "tf_example", "resnet18", "resnet20", "mobilenet_v2_075", "mobilenet_v2_100"],
         help="Model architecture",
     )
     parser.add_argument("--server-momentum", type=float, default=0.9, help="Server momentum (FedAvgM)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Client local epochs")
+    parser.add_argument("--local-steps", type=int, default=20, help="Client local optimizer steps per round")
     parser.add_argument("--batch-size", type=int, default=32, help="Client batch size")
-    parser.add_argument("--client-lr", type=float, default=0.05, help="Client learning rate (to build initial model)")
+    parser.add_argument("--client-lr", type=float, default=0.003, help="Client learning rate (to build initial model)")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
     parser.add_argument("--csv-path", default="logs/comm_times.csv", help="CSV file to log per-round per-client timing metrics")
     parser.add_argument("--data-dir", default="data_partitions_cifar100", help="Partition directory for CIFAR-100 NPZ files")
@@ -110,6 +115,13 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    use_cifar10_resnet18 = _is_cifar10(args.dataset) and args.model == "resnet18"
+    if use_cifar10_resnet18 and "--data-dir" not in sys.argv:
+        args.data_dir = "data_partitions_cifar10"
+    if use_cifar10_resnet18 and "--batch-size" not in sys.argv:
+        args.batch_size = 128
+    if use_cifar10_resnet18 and "--client-lr" not in sys.argv:
+        args.client_lr = 0.01
     if _is_ixi(args.dataset) and "--batch-size" not in sys.argv:
         args.batch_size = 2
     if _is_isic(args.dataset) and "--batch-size" not in sys.argv:
@@ -123,6 +135,7 @@ def main() -> None:
     use_ixi = _is_ixi(args.dataset)
     use_isic = _is_isic(args.dataset)
     use_cifar100 = _is_cifar100(args.dataset)
+    use_cifar10_resnet18 = _is_cifar10(args.dataset) and args.model == "resnet18"
     if use_ixi:
         import torch
         from flwr.common import ndarrays_to_parameters
@@ -162,6 +175,19 @@ def main() -> None:
         input_shape = (3, 224, 224)
         num_classes = 100
         x_train = y_train = x_test = y_test = None
+    elif use_cifar10_resnet18:
+        import torch
+        from flwr.common import ndarrays_to_parameters
+
+        from cifar10_flower import evaluate_cifar10, get_model_parameters
+        from cifar10_model import build_resnet18
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = build_resnet18(num_classes=10).to(device)
+        initial_parameters = ndarrays_to_parameters(get_model_parameters(model))
+        input_shape = (3, 32, 32)
+        num_classes = 10
+        x_train = y_train = x_test = y_test = None
     else:
         x_train, y_train, x_test, y_test, input_shape, num_classes = _load_dataset(args.dataset)
         model = None
@@ -173,7 +199,7 @@ def main() -> None:
         model_name = "resnet152_imagenet224" if use_cifar100 else args.model
         f.write(
             "dataset={dataset} model={model} rounds={rounds} clients={clients} "
-            "local_epochs={local_epochs} batch_size={batch_size} reporting_fraction={reporting_fraction} "
+            "local_epochs={local_epochs} local_steps={local_steps} batch_size={batch_size} reporting_fraction={reporting_fraction} "
             "server_lr={server_lr} server_momentum={server_momentum} downlink_num_bits={downlink_num_bits} "
             "eval_sample_size={eval_sample_size}\n".format(
                 dataset=args.dataset,
@@ -181,6 +207,7 @@ def main() -> None:
                 rounds=args.rounds,
                 clients=args.clients,
                 local_epochs=args.local_epochs,
+                local_steps=args.local_steps,
                 batch_size=args.batch_size,
                 reporting_fraction=args.reporting_fraction,
                 server_lr=args.server_lr,
@@ -189,7 +216,7 @@ def main() -> None:
                 eval_sample_size=args.eval_sample_size,
             )
         )
-    if not use_ixi and not use_isic and not use_cifar100:
+    if not use_ixi and not use_isic and not use_cifar100 and not use_cifar10_resnet18:
         from fedavgm.models import (
             cnn,
             model_to_parameters,
@@ -214,12 +241,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Fit/eval configuration helpers
     # ------------------------------------------------------------------
-    if use_ixi or use_isic or use_cifar100:
+    if use_ixi or use_isic or use_cifar100 or use_cifar10_resnet18:
         import time
 
         def fit_config_fn(server_round: int):  # pylint: disable=unused-argument
             return {
                 "local_epochs": args.local_epochs,
+                "local_steps": args.local_steps,
                 "batch_size": args.batch_size,
                 "confit_time": time.time(),
                 "server_send_time": time.time(),
@@ -228,7 +256,13 @@ def main() -> None:
         from omegaconf import OmegaConf
         from fedavgm.server import get_on_fit_config, get_evaluate_fn
 
-        cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
+        cfg = OmegaConf.create(
+            {
+                "local_epochs": args.local_epochs,
+                "local_steps": args.local_steps,
+                "batch_size": args.batch_size,
+            }
+        )
         fit_config_fn = get_on_fit_config(cfg)
     sample_size = args.eval_sample_size if args.eval_sample_size > 0 else None
     if use_ixi:
@@ -308,6 +342,31 @@ def main() -> None:
                 )
                 Path(log_file).open("a", encoding="utf-8").write(entry)
             return loss, {"accuracy": accuracy}
+    elif use_cifar10_resnet18:
+        from flwr.common import parameters_to_ndarrays
+
+        def evaluate_fn(server_round: int, parameters, config):  # pylint: disable=unused-argument
+            if hasattr(parameters, "tensors"):
+                params_list = parameters_to_ndarrays(parameters)
+            else:
+                params_list = parameters
+            loss, accuracy = evaluate_cifar10(
+                model,
+                params_list,
+                data_dir=args.data_dir,
+                device=device,
+                batch_size=args.batch_size,
+                num_workers=0,
+                sample_size=sample_size,
+                sample_seed=args.eval_sample_seed,
+            )
+            if log_file:
+                entry = (
+                    f"round={server_round} loss={loss:.6f} accuracy={accuracy:.6f} "
+                    f"samples={sample_size or 'all'}\n"
+                )
+                Path(log_file).open("a", encoding="utf-8").write(entry)
+            return loss, {"accuracy": accuracy}
     else:
         evaluate_fn = get_evaluate_fn(
             model,
@@ -351,6 +410,7 @@ def main() -> None:
         strategy = QuantizedFedAvgM(
             fraction_fit=args.reporting_fraction,
             fraction_evaluate=0.0,
+            min_fit_clients=max(1, int(args.clients * args.reporting_fraction)),
             min_available_clients=args.clients,
             on_fit_config_fn=fit_config_fn,
             evaluate_fn=evaluate_fn,

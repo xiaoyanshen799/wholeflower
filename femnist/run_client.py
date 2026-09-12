@@ -59,16 +59,22 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default="resnet20",
-        choices=["cnn", "tf_example", "resnet20", "mobilenet_v2_075", "mobilenet_v2_100"],
+        choices=["cnn", "tf_example", "resnet18", "resnet20", "mobilenet_v2_075", "mobilenet_v2_100"],
         help="Model architecture",
     )
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for local model")
+    parser.add_argument("--lr", type=float, default=0.003, help="Learning rate for local model")
     parser.add_argument(
         "--epochs",
         "--local-epochs",
         type=int,
         default=None,
         help="Local epochs per round (fallback to server config if not set)",
+    )
+    parser.add_argument(
+        "--local-steps",
+        type=int,
+        default=None,
+        help="Local optimizer steps per round (overrides epoch-based training when set)",
     )
     parser.add_argument(
         "--batch-size",
@@ -115,9 +121,16 @@ def main() -> None:
     print(f"--- Client {args.cid}: Parsed arguments.")
 
     dataset = args.dataset.lower()
+    is_cifar10_resnet18 = dataset in {"cifar", "cifar10", "cifar-10"} and args.model == "resnet18"
     is_ixi = dataset in {"ixi", "fed-ixi", "fed_ixi", "fedixi"}
     is_isic = dataset in {"isic", "isic2019", "fed-isic2019", "fed_isic2019"}
     is_cifar100 = dataset in {"cifar100", "fed-cifar100", "fed_cifar100", "cifar100-resnet"}
+    if is_cifar10_resnet18 and "--data-dir" not in sys.argv:
+        args.data_dir = "data_partitions_cifar10"
+    if is_cifar10_resnet18 and "--batch-size" not in sys.argv and "--local-batch-size" not in sys.argv:
+        args.batch_size = 128
+    if is_cifar10_resnet18 and "--lr" not in sys.argv:
+        args.lr = 0.01
     if is_cifar100 and "--data-dir" not in sys.argv:
         args.data_dir = "data_partitions_cifar100"
 
@@ -220,6 +233,63 @@ def main() -> None:
                 train_time = metrics.get("train_time")
                 if isinstance(train_time, (int, float)):
                     print(f"[Round {r}] train_time={train_time:.2f}s")
+                else:
+                    print(f"[Round {r}] training finished.")
+            return
+
+        print(f">>> Client {args.cid} connecting to {args.server}…")
+        fl.client.start_numpy_client(server_address=args.server, client=client)
+        print(f"--- Client {args.cid}: Flower client finished.")
+        return
+
+    if is_cifar10_resnet18:
+        import torch
+
+        from cifar10_flower import Cifar10FlowerClient
+
+        device = (
+            torch.device(args.device)
+            if args.device
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        default_bs = 128
+        init_bs = args.batch_size if args.batch_size is not None else default_bs
+        bs_override = args.batch_size if args.batch_size is not None else None
+
+        client = Cifar10FlowerClient(
+            data_dir=args.data_dir,
+            cid=args.cid,
+            device=device,
+            batch_size=init_bs,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            learning_rate=args.lr,
+            local_epochs_override=args.epochs,
+            local_steps_override=args.local_steps,
+            batch_size_override=bs_override,
+            enable_compression=args.uplink_num_bits != 0,
+            quantization_bits=args.uplink_num_bits if args.uplink_num_bits != 0 else 8,
+        )
+
+        if args.local_only:
+            rounds = max(1, args.local_rounds)
+            print(f">>> Client {args.cid} running local-only pre-train for {rounds} round(s)…")
+            params = client.get_parameters({})
+            epochs = args.epochs if args.epochs is not None else 1
+            local_steps = args.local_steps if args.local_steps is not None else 20
+            batch_size = args.batch_size if args.batch_size is not None else default_bs
+            for r in range(1, rounds + 1):
+                _, _, metrics = client.fit(
+                    params,
+                    {"local_epochs": epochs, "local_steps": local_steps, "batch_size": batch_size},
+                )
+                params = client.get_parameters({})
+                train_time = metrics.get("train_time")
+                if isinstance(train_time, (int, float)):
+                    print(
+                        f"[Round {r}] train_time={train_time:.2f}s "
+                        f"(local_steps={local_steps}, batch_size={batch_size})"
+                    )
                 else:
                     print(f"[Round {r}] training finished.")
             return
@@ -345,7 +415,9 @@ def main() -> None:
         y_val,
         model_cfg,
         num_classes,
+        cid=str(args.cid),
         local_epochs_override=args.epochs,
+        local_steps_override=args.local_steps,
         batch_size_override=args.batch_size,
         enable_compression=uplink_bits != 0,
         quantization_bits=uplink_bits if uplink_bits != 0 else 8,
@@ -359,12 +431,13 @@ def main() -> None:
         params = client.get_parameters({})
         # Fall back to sensible defaults if overrides are not provided.
         epochs = args.epochs if args.epochs is not None else 1
+        local_steps = args.local_steps
         batch_size = args.batch_size if args.batch_size is not None else 64
         total_time = 0.0
         for r in range(1, rounds + 1):
             _, _, metrics = client.fit(
                 params,
-                {"local_epochs": epochs, "batch_size": batch_size},
+                {"local_epochs": epochs, "local_steps": local_steps, "batch_size": batch_size},
             )
             params = client.get_parameters({})
             train_time = metrics.get("train_time")
@@ -372,7 +445,7 @@ def main() -> None:
                 total_time += float(train_time)
                 print(
                     f"[Round {r}] train_time={train_time:.2f}s on {len(x_train)} samples "
-                    f"(epochs={epochs}, batch_size={batch_size})"
+                    f"(epochs={epochs}, local_steps={local_steps}, batch_size={batch_size})"
                 )
             else:
                 print(f"[Round {r}] training finished.")

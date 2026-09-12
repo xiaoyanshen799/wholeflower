@@ -20,6 +20,7 @@ def get_on_fit_config(config: DictConfig):
         #     lr = config.lr / 10
         return {
             "local_epochs": config.local_epochs,
+            "local_steps": config.get("local_steps", None),
             "batch_size": config.batch_size,
             "confit_time": time.time(),
         }

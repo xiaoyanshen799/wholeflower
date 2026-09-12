@@ -57,6 +57,7 @@ msgpack==1.1.1
 multidict==6.6.3
 multiprocess==0.70.16
 numpy==1.24.3
+nibabel==5.2.1
 nvidia-ml-py==13.580.65
 oauthlib==3.3.1
 omegaconf==2.3.0

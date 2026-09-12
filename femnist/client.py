@@ -82,6 +82,7 @@ class FlowerClient(fl.client.NumPyClient):
         quantization_bits: int = 8,
         error_feedback: bool = True,
         local_epochs_override: Optional[int] = None,
+        local_steps_override: Optional[int] = None,
         batch_size_override: Optional[int] = None,
     ) -> None:
         target = model_cfg.get("_target_", "") if isinstance(model_cfg, dict) else ""
@@ -117,6 +118,7 @@ class FlowerClient(fl.client.NumPyClient):
             self.y_val = to_categorical(y_val, num_classes=num_classes)
 
         self._local_epochs_override = local_epochs_override
+        self._local_steps_override = local_steps_override
         self._batch_size_override = batch_size_override
 
     def get_parameters(self, config):  # pylint: disable=unused-argument
@@ -152,6 +154,11 @@ class FlowerClient(fl.client.NumPyClient):
             if self._local_epochs_override is not None
             else config.get("local_epochs")
         )
+        local_steps = (
+            self._local_steps_override
+            if self._local_steps_override is not None
+            else config.get("local_steps")
+        )
         batch_size = (
             self._batch_size_override
             if self._batch_size_override is not None
@@ -159,19 +166,32 @@ class FlowerClient(fl.client.NumPyClient):
         )
 
         logging.info(
-            "[Client] Starting local training: epochs=%s batch_size=%s",
+            "[Client] Starting local training: epochs=%s local_steps=%s batch_size=%s",
             epochs,
+            local_steps,
             batch_size,
         )
 
-        
-        self.model.fit(
-            self.x_train,
-            self.y_train,
-            epochs=epochs,
-            batch_size=batch_size,
-            verbose=False,
-        )
+        if local_steps is not None and int(local_steps) > 0:
+            import tensorflow as tf
+
+            dataset = tf.data.Dataset.from_tensor_slices((self.x_train, self.y_train))
+            dataset = dataset.shuffle(len(self.x_train), reshuffle_each_iteration=True)
+            dataset = dataset.repeat().batch(int(batch_size))
+            self.model.fit(
+                dataset,
+                epochs=1,
+                steps_per_epoch=int(local_steps),
+                verbose=False,
+            )
+        else:
+            self.model.fit(
+                self.x_train,
+                self.y_train,
+                epochs=epochs,
+                batch_size=batch_size,
+                verbose=False,
+            )
         train_end = time.time()
         train_duration = train_end - train_start
         cpu_freq_end = _read_cpu_freq_mhz()
@@ -182,8 +202,11 @@ class FlowerClient(fl.client.NumPyClient):
 
         metrics = {
             "local_epochs_used": float(epochs) if epochs is not None else None,
+            "local_steps_used": float(local_steps) if local_steps is not None else None,
             "batch_size_used": float(batch_size) if batch_size is not None else None,
         }
+        if self.cid is not None:
+            metrics["logical_cid"] = self.cid
         if isinstance(server_to_client_ms, (int, float)):
             metrics["server_to_client_ms"] = float(server_to_client_ms)
         if isinstance(server_wait_time, (int, float)):

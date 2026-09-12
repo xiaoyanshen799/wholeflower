@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/logs/cifar100.csv"
+csv_file = "/home/xiaoyan/wholeflower/femnist/logs/target330times.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -18,7 +18,7 @@ client_durations = defaultdict(list)
 client_colors = {}
 empirical_cdfs = {}
 client_num_examples = {}
-MAX_DURATION = 430.0
+MAX_DURATION = 420.0
 
 
 # 从 CSV 中提取客户端时长信息
@@ -110,7 +110,7 @@ for color, (client, records) in zip(colors, client_durations.items()):
         k0 = (np.percentile(x_data, 75) - np.percentile(x_data, 25)) / 4  # IQR/4≈σ
         p0 = [theta0, max(k0, 0.1)]
 
-        bounds = ([min(x_data), 0.05],     # k ≥ 0.05 s
+        bounds = ([min(x_data), 0.005],     # k ≥ 0.05 s
                 [max(x_data), 300.0])
 
         popt, _ = curve_fit(logistic_cdf, x_data, y_data,
@@ -361,7 +361,7 @@ if _round_col is not None:
     # 每轮内先过滤掉 >35s 的，再取最大
     per_round_time = (
         df.groupby(_round_col)["_duration"]
-        .apply(lambda x: x[x <= 430.0].max() if any(x <= 430.0) else np.nan)
+        .apply(lambda x: x[x <= 6.0].max() if any(x <= 6.0) else np.nan)
         .dropna()
         .sort_index()
         .values
@@ -373,12 +373,12 @@ if _round_col is not None:
         per_round_time_sorted = np.sort(per_round_time)
         per_round_cdf = np.arange(1, len(per_round_time_sorted) + 1) / float(len(per_round_time_sorted))
 
-        plt.plot(
-            per_round_time_sorted,
-            per_round_cdf,
-            "-", linewidth=2.5,
-            label="Actual per-round max (≤35s)"
-        )
+        # plt.plot(
+        #     per_round_time_sorted,
+        #     per_round_cdf,
+        #     "-", linewidth=2.5,
+        #     label="Actual per-round max (≤35s)"
+        # )
 
 
 plt.xlabel("Time (s)")

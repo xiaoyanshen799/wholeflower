@@ -1,7 +1,7 @@
 """CNN model architecture."""
 
 from flwr.common import ndarrays_to_parameters
-from keras.optimizers import SGD
+from keras.optimizers import Adam, SGD
 from keras.regularizers import l2
 from tensorflow import keras
 from tensorflow.nn import local_response_normalization  
@@ -87,43 +87,31 @@ def resnet20_keras(input_shape, num_classes, learning_rate):
 
 
 def cnn(input_shape, num_classes, learning_rate):
-    """CNN Model from (McMahan et. al., 2017).
-
-    Communication-efficient learning of deep networks from decentralized data
-    """
+    """FEMNIST CNN matching the 2-conv/512-fc PyTorch experiment model."""
     input_shape = tuple(input_shape)
-
-    weight_decay = 0.004
     model = keras.Sequential(
         [
             keras.layers.Conv2D(
-                64,
+                32,
                 (5, 5),
-                padding="same",
+                padding="valid",
                 activation="relu",
                 input_shape=input_shape,
             ),
-            keras.layers.MaxPooling2D((3, 3), strides=(2, 2)),
-            keras.layers.BatchNormalization(),
+            keras.layers.MaxPooling2D((2, 2)),
             keras.layers.Conv2D(
                 64,
                 (5, 5),
-                padding="same",
+                padding="valid",
                 activation="relu",
             ),
-            keras.layers.BatchNormalization(),
-            keras.layers.MaxPooling2D((3, 3), strides=(2, 2)),
+            keras.layers.MaxPooling2D((2, 2)),
             keras.layers.Flatten(),
-            keras.layers.Dense(
-                384, activation="relu", kernel_regularizer=l2(weight_decay)
-            ),
-            keras.layers.Dense(
-                192, activation="relu", kernel_regularizer=l2(weight_decay)
-            ),
+            keras.layers.Dense(512, activation="relu"),
             keras.layers.Dense(num_classes, activation="softmax"),
         ]
     )
-    optimizer = SGD(learning_rate=learning_rate)
+    optimizer = Adam(learning_rate=learning_rate)
     model.compile(
         loss="categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
     )

@@ -6,6 +6,7 @@ import csv
 import logging
 import os
 import time
+import uuid
 from logging import WARNING
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -27,6 +28,11 @@ from flwr.server.strategy import FedAvg
 from flwr.server.strategy.aggregate import aggregate
 
 from compression import ErrorFeedbackQuantizer, maybe_unpack_quantized
+
+AUDIT_CSV_COLUMNS = ["partition_id", "training_run_id", "timing_definition", "local_epochs_used",
+                     "batch_size_used", "cpu_requested", "cpu_actual", "cpu_affinity", "quota_us",
+                     "period_us", "thread_count", "resource_verified", "cgroup_cpu_usage_s",
+                     "cgroup_throttled_s", "cgroup_periods", "cgroup_throttled_periods", "bound_cpu_freq_mhz"]
 
 
 class QuantizedFedAvgM(FedAvg):
@@ -74,6 +80,12 @@ class QuantizedFedAvgM(FedAvg):
         self.server_momentum = server_momentum
         self.momentum_vector: Optional[NDArrays] = None
         self.csv_log_path = csv_log_path
+        self.training_run_id = uuid.uuid4().hex
+        if csv_log_path and os.path.isfile(csv_log_path) and os.path.getsize(csv_log_path):
+            with open(csv_log_path, newline="") as handle:
+                columns = next(csv.reader(handle), [])
+            if columns[-len(AUDIT_CSV_COLUMNS):] != AUDIT_CSV_COLUMNS:
+                raise ValueError(f"Existing CSV uses a different schema; preserve it and choose a new --csv-path: {csv_log_path}")
         self.initial_parameters = initial_parameters
 
         self.downlink_quantizer: Optional[ErrorFeedbackQuantizer] = None
@@ -93,7 +105,8 @@ class QuantizedFedAvgM(FedAvg):
     ) -> List[Tuple[ClientProxy, FitIns]]:
         config: Dict[str, Scalar] = {}
         if self.on_fit_config_fn is not None:
-            config = self.on_fit_config_fn(server_round)
+            config = dict(self.on_fit_config_fn(server_round))
+        config.update(server_round=server_round, training_run_id=self.training_run_id)
 
         parameters_to_send = parameters
         payload_label = "float32"
@@ -204,8 +217,8 @@ class QuantizedFedAvgM(FedAvg):
         parameters_aggregated = ndarrays_to_parameters(fedavgm_result)
 
         if self.csv_log_path:
-            os.makedirs(os.path.dirname(self.csv_log_path), exist_ok=True)
-            file_exists = os.path.exists(self.csv_log_path)
+            os.makedirs(os.path.dirname(self.csv_log_path) or ".", exist_ok=True)
+            file_exists = os.path.exists(self.csv_log_path) and os.path.getsize(self.csv_log_path) > 0
             with open(self.csv_log_path, "a", newline="") as f:
                 writer = csv.writer(f)
                 if not file_exists:
@@ -230,7 +243,7 @@ class QuantizedFedAvgM(FedAvg):
                             "sched_runqueue_time_ns",
                             "sched_runqueue_time_s",
                             "sched_timeslices",
-                        ]
+                        ] + AUDIT_CSV_COLUMNS
                     )
                 server_receive_time = time.time()
                 for client_proxy, fit_res in results:
@@ -264,7 +277,7 @@ class QuantizedFedAvgM(FedAvg):
                             fit_res.num_examples,
                             f"{stc:.3f}" if stc is not None else "",
                             f"{swt:.3f}" if swt is not None else "",
-                            f"{train_s:.3f}" if train_s is not None else "",
+                            train_s if train_s is not None else "",
                             f"{edcode:.3f}" if edcode is not None else "",
                             f"{c2s_ms:.3f}" if c2s_ms is not None else "",
                             f"{server_receive_time:.3f}",
@@ -278,7 +291,8 @@ class QuantizedFedAvgM(FedAvg):
                             f"{sched_runqueue_ns:.0f}" if sched_runqueue_ns is not None else "",
                             f"{sched_runqueue_s:.6f}" if sched_runqueue_s is not None else "",
                             f"{sched_timeslices:.0f}" if sched_timeslices is not None else "",
-                        ]
+                        ] + [m.get(key, self.training_run_id if key == "training_run_id" else "")
+                             for key in AUDIT_CSV_COLUMNS]
                     )
 
         metrics_aggregated: Dict[str, Scalar] = {}

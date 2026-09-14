@@ -1,0 +1,23 @@
+{
+  "dataset": "speech_commands",
+  "model": "resnet34",
+  "data_dir": "data_partitions",
+  "output_dir": "../logs/warmup_speech_run01",
+  "client_ids": [0, 1, 2, 3],
+  "epochs": 5,
+  "batch_size": 8,
+  "lr": 0.001,
+  "num_classes": 10,
+  "seed": 42,
+  "scan_rounds": 50,
+  "scan_discard": 1,
+  "validation_rounds": 30,
+  "validation_discard": 1,
+  "tolerance": 0.03,
+  "min_cpu": 0.05,
+  "max_cpu": 1.0,
+  "cpu_step": 0.001,
+  "max_iterations": 5,
+  "startup_timeout_s": 600,
+  "stage_timeout_s": 86400
+}

@@ -92,6 +92,7 @@ class FlowerClient(fl.client.NumPyClient):
         train_size: Optional[int] = None,
         val_size: Optional[int] = None,
         use_sparse_labels: Optional[bool] = None,
+        measurement_session=None,
     ) -> None:
         # Instantiate model first, then detect loss type (sparse vs categorical)
         self.model = instantiate(model_cfg)
@@ -124,6 +125,8 @@ class FlowerClient(fl.client.NumPyClient):
             use_binary = _uses_binary_crossentropy(self.model.loss)
 
         self.cid = str(cid) if cid is not None else None
+        self._measurement_session = measurement_session
+        self._measurement_round = 0
         self.enable_compression = enable_compression
         self._quantizer = (
             ErrorFeedbackQuantizer(num_bits=quantization_bits, error_feedback=error_feedback)
@@ -176,6 +179,9 @@ class FlowerClient(fl.client.NumPyClient):
         return self.model.get_weights()
 
     def fit(self, parameters, config):
+        monitor = self._measurement_session
+        resource_before = monitor.check_resources() if monitor else {}
+        self._measurement_round += 1
         fit_start = time.time()
         decode_start = time.time()
         received_parameters, was_quantized = maybe_unpack_quantized(list(parameters))
@@ -196,7 +202,6 @@ class FlowerClient(fl.client.NumPyClient):
         if isinstance(server_send_time, (int, float)):
             server_to_client_ms = max(0.0, (now - server_send_time) * 1000.0)
 
-        train_start = time.time()
         cpu_freq_start = _read_cpu_freq_mhz()
         cpu_usage_start = resource.getrusage(resource.RUSAGE_SELF)
         cpu_time_start = float(cpu_usage_start.ru_utime + cpu_usage_start.ru_stime)
@@ -218,6 +223,8 @@ class FlowerClient(fl.client.NumPyClient):
             batch_size,
         )
 
+        # Keep resource probing and logging outside the measured training interval.
+        train_start = time.perf_counter()
         if self._use_dataset:
             train_ds = self._train_dataset_fn(batch_size, training=True) if self._train_dataset_fn else None
             val_ds = self._val_dataset_fn(batch_size, training=False) if self._val_dataset_fn else None
@@ -237,7 +244,7 @@ class FlowerClient(fl.client.NumPyClient):
                 verbose=False,
             )
             num_train_examples = len(self.x_train)
-        train_end = time.time()
+        train_end = time.perf_counter()
         train_duration = train_end - train_start
         cpu_freq_end = _read_cpu_freq_mhz()
         cpu_usage_end = resource.getrusage(resource.RUSAGE_SELF)
@@ -248,6 +255,9 @@ class FlowerClient(fl.client.NumPyClient):
         metrics = {
             "local_epochs_used": float(epochs) if epochs is not None else None,
             "batch_size_used": float(batch_size) if batch_size is not None else None,
+            "partition_id": self.cid,
+            "training_run_id": config.get("training_run_id"),
+            "timing_definition": "model_fit_v2",
         }
         if isinstance(server_to_client_ms, (int, float)):
             metrics["server_to_client_ms"] = float(server_to_client_ms)
@@ -271,6 +281,30 @@ class FlowerClient(fl.client.NumPyClient):
             metrics["sched_runqueue_time_s"] = float(runqueue_delta) / 1_000_000_000.0
             metrics["sched_timeslices"] = float(timeslice_delta)
         metrics = {k: v for k, v in metrics.items() if v is not None}
+        if monitor:
+            resource_after = monitor.check_resources()
+            audit = {"cpu_requested": monitor.cpu,
+                     "cpu_actual": resource_after["cpu_actual"],
+                     "cpu_affinity": ",".join(map(str, resource_after["cpu_affinity"])),
+                     "quota_us": resource_after["quota_us"], "period_us": resource_after["period_us"],
+                     "thread_count": resource_after.get("thread_count", 0),
+                     "resource_verified": True}
+            bound_frequencies = resource_after.get("bound_cpu_frequencies_mhz", {})
+            if bound_frequencies:
+                audit["bound_cpu_freq_mhz"] = sum(bound_frequencies.values()) / len(bound_frequencies)
+            for source, destination, divisor in (
+                    ("cgroup_usage_usec", "cgroup_cpu_usage_s", 1e6),
+                    ("cgroup_throttled_usec", "cgroup_throttled_s", 1e6),
+                    ("cgroup_nr_periods", "cgroup_periods", 1),
+                    ("cgroup_nr_throttled", "cgroup_throttled_periods", 1)):
+                if source in resource_before and source in resource_after:
+                    audit[destination] = max(0, resource_after[source] - resource_before[source]) / divisor
+            # This interval spans fit processing, not just model.fit, to expose protocol CPU cost.
+            monitor.record(int(config.get("server_round", self._measurement_round)), train_duration,
+                           num_examples=num_train_examples, epochs=epochs, batch_size=batch_size,
+                           metrics={**metrics, **audit}, resource_before=resource_before,
+                           resource_after=resource_after, timing_definition="model_fit_v2")
+            metrics.update(audit)
 
         weights = [w.astype("float32", copy=True) for w in self.model.get_weights()]
         encode_time = 0.0

@@ -3,6 +3,7 @@ from datetime import datetime
 import logging
 import os
 import threading
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -306,7 +307,26 @@ def main() -> None:
         help="TiFL: Credits per tier (Algorithm 2); omit for unlimited.",
     )
 
+    parser.add_argument("--pacer-config", type=Path, help="External FedPacer control JSON; enables fixed-roster monitoring")
+    parser.add_argument("--pacer-log", type=Path, default=Path("logs/pacer_rounds.jsonl"))
+
     args = parser.parse_args()
+    pacer_source = None
+    if args.pacer_config is not None:
+        from pacer.external import FileControlSource, JsonlSink
+
+        if args.strategy in {"fedcs", "tifl"} or args.reporting_fraction != 1.0:
+            parser.error("Pacer requires FedAvg/FedAvgM and --reporting-fraction 1.0")
+        if fl.__version__ != "1.5.0":
+            parser.error("This Pacer integration targets Flower 1.5.0; use the project venv")
+        pacer_sink = JsonlSink(args.pacer_log)
+        try:
+            pacer_source = FileControlSource(args.pacer_config, pacer_sink)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        if args.clients != len(pacer_source.current.required_client_ids):
+            parser.error("--clients must equal the size of required_client_ids in the Pacer config")
+        logging.info("[Pacer] python=%s flwr=%s", sys.executable, fl.__file__)
 
     profile_url = None
     if args.profile_http_port and args.profile_http_port > 0:
@@ -549,6 +569,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Start Flower server
     # ------------------------------------------------------------------
+    if pacer_source is not None:
+        from pacer.server import PacerStrategy
+
+        strategy.min_fit_clients = args.clients
+        strategy.min_available_clients = args.clients
+        strategy.accept_failures = False
+        strategy = PacerStrategy(strategy, pacer_source, pacer_sink)
+
     print(f">>> Starting Flower server on {args.address} with strategy {strategy}…")
     fl.server.start_server(
         server_address=args.address,

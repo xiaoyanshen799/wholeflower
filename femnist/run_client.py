@@ -203,19 +203,73 @@ def main() -> None:
         help="FedCS profile: compute capability (samples/sec) reported via get_properties.",
     )
 
+    parser.add_argument("--pacer", action="store_true", help="Enable online gamma feedback for externally supplied Pacer targets")
+    parser.add_argument("--pacer-log", type=Path, default=None, help="Client Pacer JSONL (default: logs/pacer_client_<cid>.jsonl)")
+    parser.add_argument("--pacer-resource-state", type=Path, default=None, help="Optional external resource-application acknowledgement JSON")
+    parser.add_argument("--local-timing-jsonl", type=Path)
+    parser.add_argument("--local-stage-id", default="local")
+    parser.add_argument("--local-cpu-fraction", type=float)
+    parser.add_argument("--local-cpu-affinity")
+    parser.add_argument("--local-ready-file", type=Path)
+    parser.add_argument("--local-start-file", type=Path)
+    parser.add_argument("--local-start-timeout", type=float, default=600)
+    parser.add_argument("--local-seed", type=int)
+    parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--training-timing-jsonl", type=Path)
+    parser.add_argument("--cpu-fraction", type=float)
+    parser.add_argument("--cpu-affinity")
+    parser.add_argument("--measurement-run-id", default="federated")
+
     args = parser.parse_args()
+    if args.training_timing_jsonl and args.local_only:
+        parser.error("Use --local-timing-jsonl for local-only profiling")
+    if args.cpu_fraction is not None and (not 0 < args.cpu_fraction <= 1 or not args.training_timing_jsonl):
+        parser.error("--cpu-fraction requires --training-timing-jsonl and a value in (0, 1]")
+    if args.cpu_affinity and args.cpu_fraction is None:
+        parser.error("--cpu-affinity requires --cpu-fraction")
+    if args.training_timing_jsonl and args.cpu_fraction is None:
+        parser.error("--training-timing-jsonl requires --cpu-fraction")
+    runtime_measurement = None
+    if args.training_timing_jsonl:
+        from warmup.measurement import MeasurementSession
+        runtime_measurement = MeasurementSession(args.training_timing_jsonl, args.measurement_run_id,
+                                                  str(args.cid), args.cpu_fraction, args.cpu_affinity)
+        runtime_measurement.check_resources()
     if not args.local_only and not args.server:
         parser.error("--server is required unless --local-only is set")
+    if args.pacer and args.local_only:
+        parser.error("--pacer is for federated runs; local-only profiling remains external")
+    if (args.pacer_resource_state or args.pacer_log) and not args.pacer:
+        parser.error("Pacer options require --pacer")
+    if args.pacer and fl.__version__ != "1.5.0":
+        parser.error("This Pacer integration targets Flower 1.5.0; use the project venv")
+    if (args.local_timing_jsonl or args.local_ready_file or args.local_cpu_fraction is not None
+            or args.local_cpu_affinity or args.local_seed is not None) and not args.local_only:
+        parser.error("Local measurement options require --local-only")
+    if bool(args.local_ready_file) != bool(args.local_start_file):
+        parser.error("--local-ready-file and --local-start-file must be provided together")
+    if (args.local_ready_file or args.local_cpu_fraction is not None or args.local_cpu_affinity) and not args.local_timing_jsonl:
+        parser.error("Resource checks and startup barrier require --local-timing-jsonl")
+    if args.local_cpu_fraction is not None and not 0 < args.local_cpu_fraction <= 1:
+        parser.error("--local-cpu-fraction must be in (0, 1]")
+    if args.local_cpu_affinity and args.local_cpu_fraction is None:
+        parser.error("--local-cpu-affinity requires --local-cpu-fraction")
+    if args.local_rounds < 1 or args.local_start_timeout <= 0:
+        parser.error("Local rounds and startup timeout must be positive")
+    if args.local_seed is not None:
+        tf.keras.utils.set_random_seed(args.local_seed)
     print(f"--- Client {args.cid}: Parsed arguments.")
 
     # ------------------------------------------------------------------
     # Configure logging to a file per client
     # ------------------------------------------------------------------
-    log_path = pathlib.Path(args.data_dir) / f"client_{args.cid:05d}.log"
+    log_path = args.log_file or pathlib.Path(args.data_dir) / f"client_{args.cid:05d}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         filename=str(log_path),
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
+        force=args.log_file is not None,
     )
 
     print(f"--- Client {args.cid}: Loading partition...")
@@ -366,6 +420,7 @@ def main() -> None:
         y_val,
         model_cfg,
         num_classes,
+        cid=str(args.cid),
         local_epochs_override=args.epochs,
         batch_size_override=args.batch_size,
         enable_compression=uplink_bits != 0,
@@ -376,6 +431,7 @@ def main() -> None:
         train_size=train_size,
         val_size=val_size,
         use_sparse_labels=use_sparse_labels,
+        measurement_session=runtime_measurement,
     )
     print(f"--- Client {args.cid}: FlowerClient initialized successfully.")
 
@@ -387,14 +443,31 @@ def main() -> None:
         # Fall back to sensible defaults if overrides are not provided.
         epochs = args.epochs if args.epochs is not None else 5
         batch_size = args.batch_size if args.batch_size is not None else 32
+        measurement = None
+        if args.local_timing_jsonl:
+            from warmup.measurement import MeasurementSession
+
+            measurement = MeasurementSession(args.local_timing_jsonl, args.local_stage_id,
+                                             str(args.cid), args.local_cpu_fraction,
+                                             args.local_cpu_affinity)
+            if args.local_ready_file:
+                measurement.wait_for_start(args.local_ready_file, args.local_start_file,
+                                           args.local_start_timeout)
         total_time = 0.0
         for r in range(1, rounds + 1):
+            if measurement:
+                measurement.check_resources()
             _, _, metrics = client.fit(
                 params,
                 {"local_epochs": epochs, "batch_size": batch_size},
             )
             params = client.get_parameters({})
             train_time = metrics.get("train_time")
+            if measurement:
+                measurement.record(r, train_time, epochs=epochs, batch_size=batch_size,
+                                   seed=args.local_seed,
+                                   metrics=metrics, timing_definition=metrics.get("timing_definition", "unknown"),
+                                   num_examples=train_size if train_size is not None else len(x_train))
             if isinstance(train_time, (int, float)):
                 total_time += float(train_time)
                 sample_count = train_size if train_size is not None else len(x_train)
@@ -407,6 +480,13 @@ def main() -> None:
         if rounds > 1 and total_time > 0:
             print(f"Total train time over {rounds} round(s): {total_time:.2f}s")
         return
+
+    if args.pacer:
+        from pacer.client import PacerNumPyClient
+        from pacer.external import JsonlSink
+
+        pacer_log = args.pacer_log or Path("logs") / f"pacer_client_{args.cid}.jsonl"
+        client = PacerNumPyClient(client, str(args.cid), JsonlSink(pacer_log), args.pacer_resource_state)
 
     print(f">>> Client {args.cid} connecting to {args.server}…")
     fl.client.start_numpy_client(server_address=args.server, client=client)

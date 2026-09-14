@@ -1,0 +1,67 @@
+--- a/flwr/server/server.py
++++ b/flwr/server/server.py
+@@ -383,9 +383,12 @@
+     results: List[Tuple[ClientProxy, FitRes]] = []
+     failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]] = []
+ 
++    barrier_start = time.perf_counter()
+     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+         future_to_client = {}
+         for client_proxy, ins in client_instructions:
++            # Strategies may share FitIns; each worker mutates its own timing config.
++            ins = FitIns(ins.parameters, dict(ins.config))
+             down_bytes = _payload_bytes_from_parameters(ins.parameters)
+             ttype = getattr(ins.parameters, "tensor_type", "unknown") if getattr(ins, "parameters", None) else "none"
+             print(
+@@ -396,7 +399,7 @@
+             
+             ins.config["server_submit_time"] = time.time()
+             print(f"[SUBMIT] cid={_cid(client_proxy)} t_mono={time.monotonic():.6f}", flush=True)
+-            fut = executor.submit(fit_client, client_proxy, ins, timeout)
++            fut = executor.submit(fit_client, client_proxy, ins, timeout, time.perf_counter())
+             future_to_client[fut] = client_proxy
+ 
+         for future in concurrent.futures.as_completed(future_to_client):
+@@ -415,24 +418,37 @@
+                 # Inject the arrival time into the metrics dictionary
+                 if fit_res.metrics is None:
+                     fit_res.metrics = {}
+-                fit_res.metrics["server_arrival_time"] = arrival_time
++                fit_res.metrics["server_collection_time"] = arrival_time
+ 
+-                results.append((client_proxy, fit_res))
++                if fit_res.status.code == Code.OK:
++                    results.append((client_proxy, fit_res))
++                else:
++                    failures.append((client_proxy, fit_res))
+             except Exception as ex:
+-                failures.append((client_proxy, ex))
++                failures.append(ex)
+ 
++    if results and not failures:
++        barrier_end = max(res.metrics["server_complete_mono"] for _, res in results)
++        for _, res in results:
++            res.metrics["pacer.dispatch_barrier_elapsed_s"] = barrier_end - barrier_start
+     return results, failures
+ 
+ 
+ def fit_client(
+-    client: ClientProxy, ins: FitIns, timeout: Optional[float]
++    client: ClientProxy, ins: FitIns, timeout: Optional[float], submit_mono: Optional[float] = None
+ ) -> Tuple[ClientProxy, FitRes]:
+     """Refine parameters on a single client."""
+     print(f"[DISPATCH] cid={getattr(client, 'cid', getattr(client, 'cid_str', str(client)))} "
+                   f"thr={threading.current_thread().name} t_mono={time.monotonic():.6f}")
+     ins.config["server_send_time"] = time.time()
+-    ins.config["server_wait_time"] = time.time() - ins.config.get("server_submit_time", time.time())
++    start_mono = time.perf_counter()
++    ins.config["server_wait_time"] = max(0.0, start_mono - submit_mono) if submit_mono is not None else 0.0
+     fit_res = client.fit(ins, timeout=timeout)
++    complete_mono = time.perf_counter()
++    fit_res.metrics = dict(fit_res.metrics or {})
++    fit_res.metrics["server_arrival_time"] = time.time()
++    fit_res.metrics["server_complete_mono"] = complete_mono
++    fit_res.metrics["pacer.client_rpc_elapsed_s"] = complete_mono - start_mono
+     return client, fit_res
+ 
+ # def fit_clients(

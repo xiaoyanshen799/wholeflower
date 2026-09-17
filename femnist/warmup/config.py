@@ -1,4 +1,4 @@
-"""Validate a reproducible local-only calibration workload before launching it."""
+"""Validate the calibration workload before launching federated stages."""
 
 import hashlib
 import importlib.metadata
@@ -14,11 +14,13 @@ DEFAULTS = {"epochs": 5, "server_local_epochs": None, "batch_size": 8, "lr": 0.0
             "num_classes": 10, "server_bind_address": "0.0.0.0:8081",
             "client_server_address": "127.0.0.1:8081", "server_cpu_affinity": "",
             "server_csv_path": "", "reporting_fraction": 1.0, "downlink_num_bits": 0,
+            "strategy": "custom-fedavgm", "server_lr": 0.01, "server_momentum": 0.9,
             "mps_enable": 0, "enable_cpu_affinity": False,
             "seed": 42, "scan_rounds": 50, "scan_discard": 1,
             "validation_rounds": 30, "validation_discard": 1,
             "tolerance": 0.03, "min_cpu": 0.05, "max_cpu": 1.0, "cpu_step": 0.001,
-            "max_iterations": 5, "startup_timeout_s": 600, "stage_timeout_s": 86400}
+            "max_iterations": 5, "startup_timeout_s": 600, "stage_timeout_s": 86400,
+            "training_mode": "epochs", "local_steps": None, "heterogeneity": None}
 SCAN_CPUS = (0.3, 0.5, 0.7, 0.9)
 
 
@@ -43,9 +45,20 @@ def prepare_config(raw, project_dir, simulate=False):
     if set(raw) - allowed:
         raise ValueError(f"Unknown config keys: {sorted(set(raw) - allowed)}")
     cfg = {**DEFAULTS, **raw}
+    from fixed_step_training import SUPPORTED_DATASETS, positive_steps
+    if cfg["training_mode"] not in ("epochs", "steps"):
+        raise ValueError("training_mode must be epochs or steps")
+    if cfg["training_mode"] == "steps":
+        positive_steps(cfg["local_steps"])
+        if cfg.get("dataset") not in SUPPORTED_DATASETS:
+            raise ValueError("Fixed-step mode currently requires array-backed training data")
+    elif cfg["local_steps"] is not None:
+        raise ValueError("Set training_mode=steps when providing local_steps")
     for key in ("dataset", "model", "data_dir", "output_dir"):
         if not isinstance(cfg.get(key), str) or not cfg[key].strip():
             raise ValueError(f"Config requires a nonempty {key}")
+    if cfg["strategy"] not in ("fedavg", "fedavgm", "custom-fedavgm", "fedcs", "tifl"):
+        raise ValueError("Unsupported strategy")
     if cfg["server_local_epochs"] is None:
         cfg["server_local_epochs"] = cfg["epochs"]
     for key in ("epochs", "server_local_epochs", "batch_size", "num_classes", "scan_rounds",
@@ -75,10 +88,15 @@ def prepare_config(raw, project_dir, simulate=False):
     for phase in ("scan", "validation"):
         if cfg[f"{phase}_rounds"] - cfg[f"{phase}_discard"] < 3:
             raise ValueError(f"{phase} needs at least three retained rounds")
-    for key in ("lr", "reporting_fraction", "tolerance", "min_cpu", "max_cpu", "cpu_step",
+    for key in ("lr", "server_lr", "reporting_fraction", "tolerance", "min_cpu", "max_cpu", "cpu_step",
                 "startup_timeout_s", "stage_timeout_s"):
         if isinstance(cfg[key], bool) or not isinstance(cfg[key], (int, float)) or not math.isfinite(cfg[key]) or cfg[key] <= 0:
             raise ValueError(f"{key} must be finite and positive")
+    if (isinstance(cfg["server_momentum"], bool)
+            or not isinstance(cfg["server_momentum"], (int, float))
+            or not math.isfinite(cfg["server_momentum"])
+            or cfg["server_momentum"] < 0):
+        raise ValueError("server_momentum must be finite and nonnegative")
     if not 0 < cfg["reporting_fraction"] <= 1:
         raise ValueError("reporting_fraction must be in (0, 1]")
     if not 0 < cfg["tolerance"] < 1:
@@ -128,6 +146,8 @@ def prepare_config(raw, project_dir, simulate=False):
     if not simulate and set(cpu_ids) - os.sched_getaffinity(0):
         raise ValueError("cpu_ids includes CPUs unavailable to this process")
     cfg["client_ids"], cfg["cpu_ids"] = ids, cpu_ids
+    from .heterogeneity import prepare_heterogeneity
+    cfg["heterogeneity"] = prepare_heterogeneity(cfg["heterogeneity"], cfg)
     cfg["partitions"] = {cid: partitions[cid] for cid in ids} if not simulate else {}
     runtime = {}
     for name in ("numpy", "scipy", "tensorflow", "flwr"):
@@ -139,7 +159,8 @@ def prepare_config(raw, project_dir, simulate=False):
     sources = list((project / "warmup").glob("*.py"))
     sources += [project / name for name in ("run_client.py", "client.py", "launch_clients.sh",
                                            "warmup_control.py", "warmup_launch.py", "fedavgm/models.py",
-                                           "fedavgm/dataset.py")]
+                                           "fedavgm/dataset.py", "run_server.py", "strategy.py",
+                                           "fedavgm/server.py", "fixed_step_training.py")]
     cfg["source_hashes"] = {str(path.relative_to(project)): hashlib.sha256(path.read_bytes()).hexdigest()
                             for path in sorted(sources) if path.is_file()}
     return cfg

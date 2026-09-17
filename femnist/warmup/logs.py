@@ -19,16 +19,18 @@ def export_stage(run_dir, stage, config):
     if not attempt.resolve().is_relative_to(stage.resolve()):
         raise ValueError("Invalid stage attempt path")
     phase = "scan" if stage.name.startswith("scan_") else "validation"
-    discard = config[f"{phase}_discard"]
+    discard = complete.get("discard", config[f"{phase}_discard"])
+    rounds = complete.get("rounds", config[f"{phase}_rounds"])
     rows, sources = [], []
     for cid in config["client_ids"]:
         source = attempt / f"client_{cid}.jsonl"
         records = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
         recorded_rounds = [record["round"] for record in records]
-        expected_rounds = range(discard + 1, config[f"{phase}_rounds"] + 1)
-        if (recorded_rounds != sorted(recorded_rounds)
+        expected_rounds = range(discard + 1, rounds + 1)
+        if (any(type(r) is not int or r < 1 or r > rounds for r in recorded_rounds)
+                or recorded_rounds != sorted(recorded_rounds)
                 or len(recorded_rounds) != len(set(recorded_rounds))
-                or any(type(r) is not int or r < 1 or r > config[f"{phase}_rounds"] for r in recorded_rounds)):
+                ):
             raise ValueError(f"Duplicate, unordered or out-of-range rounds in {source}")
         missing_retained = [r for r in expected_rounds if r not in recorded_rounds]
         if missing_retained:
@@ -46,6 +48,13 @@ def export_stage(run_dir, stage, config):
                          "client_train_s": duration, "used_for_fit": record["round"] > discard,
                          "timing_definition": record.get("timing_definition", "legacy_v1"),
                          "source_jsonl": str(source)})
+            if config.get("training_mode") == "steps":
+                from .speed import validate_step_record
+                validate_step_record(record, config["local_steps"], config["batch_size"], config["seed"])
+                metrics = record["metrics"]
+                rows[-1].update({key: metrics[key] for key in (
+                    "training_mode", "local_steps_requested", "local_steps_used", "batch_size_used",
+                    "processed_examples", "steps_per_second", "step_seed")})
         sources.append(str(source))
     destination = run_dir / "timing_exports"
     destination.mkdir(exist_ok=True)

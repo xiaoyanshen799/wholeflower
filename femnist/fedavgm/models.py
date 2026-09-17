@@ -231,6 +231,62 @@ def resnet18_keras(input_shape, num_classes, learning_rate):
     return model
 
 
+def _fedcompass_cifar10_block(x, filters: int, stride: int):
+    """ResNet-18 basic block used by the FedCompass CIFAR-10 experiments."""
+    shortcut = x
+    y = keras.layers.Conv2D(
+        filters, 3, strides=stride, padding="same", use_bias=False,
+        kernel_initializer="he_normal",
+    )(x)
+    y = keras.layers.BatchNormalization(momentum=0.9, epsilon=1e-5)(y)
+    y = keras.layers.ReLU()(y)
+    y = keras.layers.Conv2D(
+        filters, 3, strides=1, padding="same", use_bias=False,
+        kernel_initializer="he_normal",
+    )(y)
+    y = keras.layers.BatchNormalization(momentum=0.9, epsilon=1e-5)(y)
+
+    if stride != 1 or x.shape[-1] != filters:
+        shortcut = keras.layers.Conv2D(
+            filters, 1, strides=stride, padding="valid", use_bias=False,
+            kernel_initializer="he_normal",
+        )(shortcut)
+        shortcut = keras.layers.BatchNormalization(momentum=0.9, epsilon=1e-5)(shortcut)
+
+    return keras.layers.ReLU()(keras.layers.Add()([y, shortcut]))
+
+
+def fedcompass_cifar10_resnet18(input_shape, num_classes, learning_rate):
+    """CIFAR-10 ResNet-18 and client optimizer from Li et al. (2024)."""
+    inputs = keras.Input(shape=tuple(input_shape))
+    x = keras.layers.Conv2D(
+        64, 3, strides=1, padding="same", use_bias=False,
+        kernel_initializer="he_normal",
+    )(inputs)
+    x = keras.layers.BatchNormalization(momentum=0.9, epsilon=1e-5)(x)
+    x = keras.layers.ReLU()(x)
+
+    for stage, filters in enumerate((64, 128, 256, 512)):
+        for block in range(2):
+            stride = 2 if stage > 0 and block == 0 else 1
+            x = _fedcompass_cifar10_block(x, filters, stride)
+
+    # The paper specifies a 4x4 average pool after the final 4x4 feature map.
+    x = keras.layers.AveragePooling2D(pool_size=4, strides=4)(x)
+    x = keras.layers.Flatten()(x)
+    outputs = keras.layers.Dense(int(num_classes))(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="fedcompass_cifar10_resnet18")
+    model.compile(
+        optimizer=keras.optimizers.SGD(learning_rate=learning_rate),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+    # The reference APPFL trainer creates a fresh optimizer for every local task.
+    model._reset_optimizer_each_round = True
+    return model
+
+
 def resnet34_keras(input_shape, num_classes, learning_rate):
     """Keras ResNet-34 adapted for CIFAR/MNIST-style inputs.
 
@@ -325,6 +381,37 @@ def cnn(input_shape, num_classes, learning_rate):
         loss="categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
     )
 
+    return model
+
+
+def fedcompass_mnist_cnn(input_shape, num_classes, learning_rate):
+    """MNIST CNN used in the FedCompass experiments (Li et al., 2024)."""
+    inputs = keras.Input(shape=tuple(input_shape))
+    x = keras.layers.Conv2D(32, kernel_size=5, strides=1, padding="valid")(inputs)
+    x = keras.layers.ReLU()(x)
+    x = keras.layers.MaxPooling2D(pool_size=2, strides=2)(x)
+    x = keras.layers.Conv2D(64, kernel_size=5, strides=1, padding="valid")(x)
+    x = keras.layers.ReLU()(x)
+    x = keras.layers.MaxPooling2D(pool_size=2, strides=2)(x)
+    x = keras.layers.Flatten()(x)
+    x = keras.layers.Dense(512)(x)
+    x = keras.layers.ReLU()(x)
+    outputs = keras.layers.Dense(int(num_classes))(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="fedcompass_mnist_cnn")
+    optimizer = keras.optimizers.Adam(
+        learning_rate=learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-8,
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+    # The reference trainer creates a fresh local Adam optimizer for every task.
+    model._reset_optimizer_each_round = True
     return model
 
 

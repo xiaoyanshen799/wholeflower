@@ -21,6 +21,8 @@ MODEL=${MODEL:-resnet34}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-0.001}
 LOCAL_EPOCHS=${LOCAL_EPOCHS:-}
+LOCAL_STEPS=${LOCAL_STEPS:-}
+STEP_SEED=${STEP_SEED:-}
 NUM_CLASSES=${NUM_CLASSES:-10}
 CPU_ONLY=${CPU_ONLY:-0}
 MPS_ENABLE=${MPS_ENABLE:-1}
@@ -258,6 +260,12 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   )
   if [[ -n "$LOCAL_EPOCHS" ]]; then
     client_cmd+=(--epochs "$LOCAL_EPOCHS")
+  fi
+  if [[ -n "$LOCAL_STEPS" ]]; then
+    client_cmd+=(--local-steps "$LOCAL_STEPS")
+  fi
+  if [[ -n "$STEP_SEED" ]]; then
+    client_cmd+=(--step-seed "$STEP_SEED")
   fi
   if [[ "$PACER_ENABLE" == "1" ]]; then
     client_cmd+=(--pacer)

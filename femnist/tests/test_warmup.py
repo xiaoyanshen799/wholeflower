@@ -303,8 +303,9 @@ class PipelineTests(unittest.TestCase):
         output = Path(self.cfg["output_dir"])
         self.assertTrue((output / "final_cpu_config.csv").exists())
         launch = (output / "launch_final_clients.sh").read_text()
-        for fragment in ("CPU_ONLY=1", "CPU_MAP_ONLY=1", "LOCAL_EPOCHS=5", "BATCH_SIZE=8", '"$1" 0'):
+        for fragment in ("ENABLE_CPU_AFFINITY=0", "CPU_MAP_ONLY=1", "LOCAL_EPOCHS=5", "BATCH_SIZE=8", '"$1" 0'):
             self.assertIn(fragment, launch)
+        self.assertNotIn("CPU_ONLY=1", launch)
         damaged = output / "stages/validate_002/attempt_001/client_0.jsonl"
         damaged.write_text("{}\n")
         with self.assertRaises(ValueError):

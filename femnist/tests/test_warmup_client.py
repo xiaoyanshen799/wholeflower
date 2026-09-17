@@ -44,7 +44,7 @@ class ClientEntryTests(unittest.TestCase):
             self.assertEqual([row["train_time_s"] for row in rows], durations)
             self.assertEqual([row["round"] for row in rows], [1, 2, 3])
             self.assertTrue(all(row["epochs"] == 2 and row["batch_size"] == 4 and row["seed"] == 42 for row in rows))
-            self.assertTrue(all(row["num_examples"] == 9 for row in rows))
+            self.assertTrue(all(row["num_examples"] == 10 for row in rows))
             self.assertEqual(json.loads((root / "ready.json").read_text())["stage_id"], "test")
             dependencies["tensorflow"].keras.utils.set_random_seed.assert_called_once_with(42)
             dependencies["flwr"].client.start_numpy_client.assert_not_called()

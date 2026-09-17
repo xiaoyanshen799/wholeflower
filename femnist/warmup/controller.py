@@ -15,6 +15,7 @@ from pathlib import Path
 from .config import SCAN_CPUS, fingerprint
 from .measurement import atomic_json
 from .model import adjust_cpu, fit_cpu_model, fit_logistic, quantize_cpu
+from .pacer_target import build_pacer_control
 
 
 def write_csv(path, rows):
@@ -29,12 +30,13 @@ def write_csv(path, rows):
     temporary.replace(path)
 
 
-def read_timings(path, stage_id, client, rounds, discard):
+def read_records(path, stage_id, client, rounds, discard, expected_steps=None, batch_size=None, seed=None):
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     recorded_rounds = [row.get("round") for row in rows]
-    if (recorded_rounds != sorted(recorded_rounds)
+    if (any(type(r) is not int or r < 1 or r > rounds for r in recorded_rounds)
+            or recorded_rounds != sorted(recorded_rounds)
             or len(recorded_rounds) != len(set(recorded_rounds))
-            or any(type(r) is not int or r < 1 or r > rounds for r in recorded_rounds)):
+            ):
         raise ValueError(f"{path}: duplicated, unordered or out-of-range rounds (expected 1..{rounds})")
     retained_rounds = [r for r in recorded_rounds if r > discard]
     missing_retained = [r for r in range(discard + 1, rounds + 1) if r not in retained_rounds]
@@ -52,7 +54,25 @@ def read_timings(path, stage_id, client, rounds, discard):
         duration = row.get("train_time_s", float("nan"))
         if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
             raise ValueError(f"{path}: invalid training duration")
+        if expected_steps is not None:
+            from .speed import validate_step_record
+            validate_step_record(row, expected_steps, batch_size, seed)
+    return rows
+
+
+def read_timings(path, stage_id, client, rounds, discard, expected_steps=None, batch_size=None, seed=None):
+    rows = read_records(path, stage_id, client, rounds, discard, expected_steps, batch_size, seed)
     return [row["train_time_s"] for row in rows if row["round"] > discard]
+
+
+def batch_key(clients, rounds, discard, cfg):
+    value = {"clients": clients, "rounds": rounds, "discard": discard}
+    if cfg.get("training_mode") == "steps":
+        from fixed_step_training import TIMING_DEFINITION
+        value["workload"] = {"training_mode": "steps", "local_steps": cfg["local_steps"],
+                             "batch_size": cfg["batch_size"], "step_seed": cfg["seed"],
+                             "timing_definition": TIMING_DEFINITION}
+    return fingerprint(value)
 
 
 def _split_host_port(address):
@@ -102,14 +122,19 @@ def external_stage(job):
     server_command = [
         job["python"], "-m", "run_server",
         "--dataset", job["dataset"], "--model", job["model"],
+        "--strategy", job["strategy"],
         "--clients", str(len(job["clients"])), "--rounds", str(job["rounds"]),
         "--reporting-fraction", str(job["reporting_fraction"]),
         "--address", job["server_bind_address"],
         "--client-lr", str(job["lr"]), "--batch-size", str(job["batch_size"]),
         "--local-epochs", str(job["server_local_epochs"]),
+        "--server-lr", str(job["server_lr"]),
+        "--server-momentum", str(job["server_momentum"]),
         "--downlink-num-bits", str(job["downlink_num_bits"]),
         "--csv-path", server_csv,
     ]
+    if job.get("training_mode") == "steps":
+        server_command += ["--local-steps", str(job["local_steps"]), "--step-seed", str(job["seed"])]
     if job.get("server_cpu_affinity"):
         server_command = ["taskset", "-c", job["server_cpu_affinity"], *server_command]
     server_env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "FLWR_TELEMETRY_ENABLED": "0"}
@@ -121,6 +146,8 @@ def external_stage(job):
         "BATCH_SIZE": str(job["batch_size"]),
         "LR": str(job["lr"]),
         "LOCAL_EPOCHS": str(job["epochs"]),
+        "LOCAL_STEPS": str(job["local_steps"]) if job.get("training_mode") == "steps" else "",
+        "STEP_SEED": str(job["seed"]) if job.get("training_mode") == "steps" else "",
         "NUM_CLASSES": str(job["num_classes"]),
         "MPS_ENABLE": str(job["mps_enable"]),
         "CLIENT_LOG_DIR": str(output),
@@ -185,6 +212,7 @@ class Calibration:
         self.cfg, self.stage_runner = cfg, stage_runner
         self.output = Path(cfg["output_dir"])
         self.cid_list = cfg["client_ids"]
+        self.batch_speeds = {}
         if cfg["enable_cpu_affinity"]:
             self.affinity = dict(zip(self.cid_list, map(str, cfg["cpu_ids"])))
         else:
@@ -195,7 +223,7 @@ class Calibration:
         directory.mkdir(parents=True, exist_ok=True)
         clients = [{"client_id": cid, "cpu": cpus[cid], "cpu_affinity": self.affinity[cid]}
                    for cid in self.cid_list]
-        key = fingerprint({"clients": clients, "rounds": rounds, "discard": discard})
+        key = batch_key(clients, rounds, discard, self.cfg)
         complete = directory / "complete.json"
         if complete.exists():
             cached = json.loads(complete.read_text())
@@ -211,18 +239,29 @@ class Calibration:
             stage_id = f"{name}/{attempt.name}"
             cpu_map_csv = attempt / "requested_cpu_config.csv"
             job = {**self.cfg, "stage_id": stage_id, "output_dir": str(attempt),
-                   "clients": clients, "rounds": rounds, "cpu_map_csv": str(cpu_map_csv)}
+                   "clients": clients, "rounds": rounds, "discard": discard, "cpu_map_csv": str(cpu_map_csv)}
             write_csv(cpu_map_csv, clients)
             write_csv(attempt / "cpu_config.csv", clients)
+            atomic_json(attempt / "job.json", job)
             print(f"Run {name}: {rounds} rounds, CPU {cpus}", flush=True)
             self.stage_runner(job)
         fits = {}
+        speeds = {}
+        steps = self.cfg.get("local_steps") if self.cfg.get("training_mode") == "steps" else None
         for client in clients:
-            samples = read_timings(attempt / f"client_{client['client_id']}.jsonl", stage_id,
-                                   client, rounds, discard)
-            fits[client["client_id"]] = fit_logistic(samples)
+            records = read_records(attempt / f"client_{client['client_id']}.jsonl", stage_id,
+                                   client, rounds, discard, steps, self.cfg["batch_size"], self.cfg["seed"])
+            retained = [row for row in records if row["round"] > discard]
+            fits[client["client_id"]] = fit_logistic([row["train_time_s"] for row in retained])
+            if steps is not None:
+                from .speed import summarize_speed
+                speeds[client["client_id"]] = summarize_speed(retained)
+        if speeds:
+            atomic_json(attempt / "speeds.json", speeds)
+            self.batch_speeds[name] = speeds
         atomic_json(attempt / "fits.json", {cid: fit.to_dict() for cid, fit in fits.items()})
-        atomic_json(complete, {"key": key, "stage_id": stage_id, "attempt": attempt.name})
+        atomic_json(complete, {"key": key, "stage_id": stage_id, "attempt": attempt.name,
+                               "rounds": rounds, "discard": discard})
         from .logs import export_stage
         export_stage(self.output, directory, self.cfg)
         return fits
@@ -249,7 +288,8 @@ class Calibration:
             atomic_json(self.output / "latest_config.json", self.cfg)
             try:
                 # A failed resumed audit must not leave a stale launchable result.
-                for name in ("final_cpu_config.csv", "simulated_cpu_config.csv", "launch_final_clients.sh"):
+                for name in ("final_cpu_config.csv", "simulated_cpu_config.csv", "launch_final_clients.sh",
+                             "pacer-control.json"):
                     (self.output / name).unlink(missing_ok=True)
                 atomic_json(self.output / "status.json", {"status": "running", "simulation": self.cfg["simulation"]})
                 return self._calibrate()
@@ -262,26 +302,36 @@ class Calibration:
         cfg = self.cfg
         points = {cid: [] for cid in self.cid_list}
         profile_rows = []
+        speed_rows = []
         for cpu in SCAN_CPUS:
             fits = self.batch(f"scan_{round(cpu * 100):02d}", dict.fromkeys(self.cid_list, cpu),
                               cfg["scan_rounds"], cfg["scan_discard"])
             for cid, fit in fits.items():
                 points[cid].append((cpu, fit.theta_s))
                 profile_rows.append({"client_id": cid, "cpu": cpu, **fit.to_dict()})
+                if cfg.get("training_mode") == "steps":
+                    speed_rows.append({"client_id": cid, "cpu": cpu,
+                                       **self.batch_speeds[f"scan_{round(cpu * 100):02d}"][cid]})
             write_csv(self.output / "profiles.csv", profile_rows)
+            if speed_rows:
+                write_csv(self.output / "speed_profiles.csv", speed_rows)
         models = {cid: fit_cpu_model(points[cid]) for cid in self.cid_list}
         atomic_json(self.output / "cpu_models.json", {cid: model.to_dict() for cid, model in models.items()})
-        # The target is measured at 90%, not extrapolated from the CPU model.
-        slowest = max(self.cid_list, key=lambda cid: points[cid][-1][1])
-        target = points[slowest][-1][1]
-        atomic_json(self.output / "target.json", {"theta_target_s": target, "slowest_client_id": slowest,
-                                                 "reference_cpu": 0.9, "definition": "max_fitted_theta_at_90_percent"})
-        cpus = {cid: quantize_cpu(models[cid].inverse(target), cfg["min_cpu"], cfg["max_cpu"], cfg["cpu_step"])
-                for cid in self.cid_list}
+        if (cfg.get("heterogeneity") or {}).get("enabled"):
+            from .heterogeneity import initialize_from_speed_plan
+            cpus, target, history = initialize_from_speed_plan(self, models, points)
+        else:
+            # Legacy initialization still uses the measured 90% timing anchor.
+            slowest = max(self.cid_list, key=lambda cid: points[cid][-1][1])
+            target = points[slowest][-1][1]
+            atomic_json(self.output / "target.json", {"theta_target_s": target, "slowest_client_id": slowest,
+                                                     "reference_cpu": 0.9, "definition": "max_fitted_theta_at_90_percent"})
+            cpus = {cid: quantize_cpu(models[cid].inverse(target), cfg["min_cpu"], cfg["max_cpu"], cfg["cpu_step"])
+                    for cid in self.cid_list}
+            history = {cid: list(points[cid]) for cid in self.cid_list}
         write_csv(self.output / "initial_cpu_config.csv", [
             {"client_id": cid, "cpu": cpus[cid], "cpu_affinity": self.affinity[cid],
              "extrapolated": cpus[cid] < 0.3 or cpus[cid] > 0.9} for cid in self.cid_list])
-        history = {cid: list(points[cid]) for cid in self.cid_list}
         validation_rows = []
         for iteration in range(1, cfg["max_iterations"] + 1):
             fits = self.batch(f"validate_{iteration:03d}", cpus, cfg["validation_rounds"], cfg["validation_discard"])
@@ -325,8 +375,17 @@ class Calibration:
                  "validation_iteration": iteration, "simulation": self.cfg["simulation"],
                  "passed": cid not in failing, "converged": converged,
                  "export_reason": export_reason} for cid in self.cid_list]
+        if self.cfg.get("training_mode") == "steps":
+            for row in rows:
+                row.update(training_mode="steps", local_steps=self.cfg["local_steps"],
+                           batch_size=self.cfg["batch_size"], step_seed=self.cfg["seed"])
         filename = "simulated_cpu_config.csv" if self.cfg["simulation"] else "final_cpu_config.csv"
         write_csv(self.output / filename, rows)
+        target_record = json.loads((self.output / "target.json").read_text())
+        if (not self.cfg["simulation"]
+                and target_record.get("definition") == "rounded_deadline_from_max_fitted_theta_at_heterogeneous_initial"):
+            atomic_json(self.output / "pacer-control.json",
+                        build_pacer_control(self.output, self.cid_list, target_record))
         if not self.cfg["simulation"]:
             env = {"PY": self.cfg["python"], "DATASET": self.cfg["dataset"], "MODEL": self.cfg["model"],
                    "BATCH_SIZE": str(self.cfg["batch_size"]), "LOCAL_EPOCHS": str(self.cfg["epochs"]),
@@ -334,6 +393,8 @@ class Calibration:
                    "MPS_ENABLE": str(self.cfg["mps_enable"]),
                    "ENABLE_CPU_AFFINITY": "1" if self.cfg["enable_cpu_affinity"] else "0",
                    "BIND_CLIENT_TO_CPU": "0",
+                   "LOCAL_STEPS": str(self.cfg["local_steps"]) if self.cfg.get("training_mode") == "steps" else "",
+                   "STEP_SEED": str(self.cfg["seed"]) if self.cfg.get("training_mode") == "steps" else "",
                    "CPU_MAP_ONLY": "1", "CPU_MAP_CSV": str(self.output / filename)}
             command = " ".join(shlex.quote(f"{key}={value}") for key, value in env.items())
             warning = ""

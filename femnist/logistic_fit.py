@@ -7,7 +7,7 @@ from scipy.optimize import brentq, curve_fit
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/femnist/logs/mnistdata/warmup_femnist20_server_client_run03/pacer_export_20260913_230707/pacer_atest_like.csv"
+csv_file = "/home/xiaoyan/wholeflower/femnist/logs/mnistdata/pacer_mnist20_run01/server.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)

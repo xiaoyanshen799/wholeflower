@@ -127,7 +127,7 @@ def _summarize(y: np.ndarray, client_indices: Sequence[Sequence[int]], num_class
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download MNIST and partition it into cross-silo client splits (FedCompass)."
+        description="Partition MNIST or CIFAR-10 into FedCompass cross-silo client splits."
     )
     parser.add_argument("--num-clients", type=int, default=10)
     parser.add_argument(
@@ -147,7 +147,7 @@ def main() -> None:
     parser.add_argument(
         "--partition-test",
         action="store_true",
-        help="Also partition the MNIST test set into per-client splits.",
+        help="Also partition the test set into per-client splits.",
     )
     parser.add_argument(
         "--dataset",
@@ -197,7 +197,7 @@ def main() -> None:
             y_train,
             num_clients=args.num_clients,
             num_classes=num_classes,
-            alpha1=alpha1*5,
+            alpha1=alpha1,
             alpha2=args.alpha2,
             rng=rng,
         )
@@ -245,7 +245,7 @@ def main() -> None:
                 y_test,
                 num_clients=args.num_clients,
                 num_classes=num_classes,
-                alpha1=alpha1*5,
+                alpha1=alpha1,
                 alpha2=args.alpha2,
                 rng=rng_test,
             )

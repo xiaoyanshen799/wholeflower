@@ -108,7 +108,11 @@ def get_evaluate_fn(
             x_eval = x_test[indices]
             y_eval = y_test[indices]
 
-        if getattr(y_eval, "ndim", 1) == 2:
+        # Keras' CIFAR-10 loader stores ordinary class IDs as shape (N, 1).
+        # Only a matrix with multiple target columns is a multi-label target;
+        # treating (N, 1) as multi-label makes it incompatible with the
+        # model's (N, num_classes) logits.
+        if getattr(y_eval, "ndim", 1) == 2 and y_eval.shape[1] > 1:
             logits = model.predict(x_eval, batch_size=256, verbose=False)
             loss, metrics = _multilabel_eval(logits, y_eval)
             if log_path:

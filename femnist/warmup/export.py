@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from .config import fingerprint
-from .controller import Calibration, read_timings
+from .controller import Calibration, batch_key, read_timings
 from .measurement import atomic_json, load_cpu_map
 from .model import TimingFit
 
@@ -49,14 +49,19 @@ def export_last(output_dir):
         clients = [{"client_id": cid, "cpu": cpu_map[cid][0], "cpu_affinity": cpu_map[cid][1]}
                    for cid in cfg["client_ids"]]
         rounds, discard = cfg["validation_rounds"], cfg["validation_discard"]
-        if fingerprint({"clients": clients, "rounds": rounds, "discard": discard}) != complete["key"]:
+        if batch_key(clients, rounds, discard, cfg) != complete["key"]:
             raise ValueError("Validation CPU allocation does not match the completion record")
         for client, cpu_id in zip(clients, cfg["cpu_ids"]):
-            if client["cpu_affinity"] != str(cpu_id):
+            expected_affinity = str(cpu_id) if cfg.get("enable_cpu_affinity", True) else "-"
+            if client["cpu_affinity"] != expected_affinity:
                 raise ValueError("Validation affinity differs from the stored configuration")
         if not cfg["simulation"]:
             job = json.loads((attempt / "job.json").read_text())
             fields = ("dataset", "model", "data_dir", "epochs", "batch_size", "lr", "num_classes", "seed")
+            if cfg.get("training_mode") == "steps":
+                fields += ("training_mode", "local_steps", "heterogeneity", "server_local_epochs",
+                           "enable_cpu_affinity", "server_cpu_affinity", "reporting_fraction", "downlink_num_bits",
+                           "strategy", "server_lr", "server_momentum")
             if (job["stage_id"] != stage_id or job["clients"] != clients or job["rounds"] != rounds
                     or any(job[key] != cfg[key] for key in fields)):
                 raise ValueError("Validation job differs from the stored workload")
@@ -66,7 +71,9 @@ def export_last(output_dir):
         fits = {}
         for client in clients:
             cid = client["client_id"]
-            samples = read_timings(attempt / f"client_{cid}.jsonl", stage_id, client, rounds, discard)
+            samples = read_timings(attempt / f"client_{cid}.jsonl", stage_id, client, rounds, discard,
+                                   cfg.get("local_steps") if cfg.get("training_mode") == "steps" else None,
+                                   cfg["batch_size"], cfg["seed"])
             fit = TimingFit(**saved_fits[cid])
             values = (fit.theta_s, fit.k_s, fit.ks_distance, fit.empirical_p90_s)
             if (not all(math.isfinite(value) for value in values) or fit.theta_s <= 0 or fit.k_s <= 0
@@ -74,6 +81,9 @@ def export_last(output_dir):
                 raise ValueError(f"Invalid saved fit for client {cid}")
             fits[cid] = fit
         target = json.loads((output / "target.json").read_text())["theta_target_s"]
+        if (cfg.get("heterogeneity") or {}).get("enabled"):
+            from .heterogeneity import validate_speed_target
+            validate_speed_target(output, cfg)
         if not math.isfinite(target) or target <= 0:
             raise ValueError("Invalid saved target")
         with (output / "validation_history.csv").open(newline="") as handle:

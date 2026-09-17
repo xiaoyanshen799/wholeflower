@@ -135,6 +135,8 @@ def main() -> None:
         default="resnet20",
         choices=[
             "cnn",
+            "fedcompass_cifar10_resnet18",
+            "fedcompass_mnist_cnn",
             "tf_example",
             "resnet18",
             "resnet34",
@@ -152,6 +154,8 @@ def main() -> None:
         help="Model architecture",
     )
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for local model")
+    parser.add_argument("--local-steps", type=int, help="Optimizer updates per round; replaces epoch-based work")
+    parser.add_argument("--step-seed", type=int, help="Fixed-step data sampling seed (default: server value or 42)")
     parser.add_argument(
         "--epochs",
         "--local-epochs",
@@ -221,6 +225,15 @@ def main() -> None:
     parser.add_argument("--measurement-run-id", default="federated")
 
     args = parser.parse_args()
+    from fixed_step_training import SUPPORTED_DATASETS, positive_steps, resolve_seed
+    try:
+        if args.local_steps is not None:
+            positive_steps(args.local_steps)
+            if args.dataset not in SUPPORTED_DATASETS:
+                raise ValueError("Fixed-step mode currently requires array-backed training data")
+        resolve_seed(args.step_seed)
+    except ValueError as error:
+        parser.error(str(error))
     if args.training_timing_jsonl and args.local_only:
         parser.error("Use --local-timing-jsonl for local-only profiling")
     if args.cpu_fraction is not None and (not 0 < args.cpu_fraction <= 1 or not args.training_timing_jsonl):
@@ -346,7 +359,12 @@ def main() -> None:
             x_full = np.expand_dims(x_full, axis=-1)
 
         split_idx = int(0.9 * len(x_full))
-        x_train, y_train = x_full[:split_idx], y_full[:split_idx]
+        if dataset_name == "mnist" or args.model == "fedcompass_cifar10_resnet18":
+            # Train on every sample assigned to the FedCompass client. Keep a local
+            # validation view for compatibility without withholding data.
+            x_train, y_train = x_full, y_full
+        else:
+            x_train, y_train = x_full[:split_idx], y_full[:split_idx]
         x_val, y_val = x_full[split_idx:], y_full[split_idx:]
 
         num_classes = args.num_classes
@@ -355,6 +373,8 @@ def main() -> None:
     # Build Hydra-style config dict for FlowerClient
     target_map = {
         "cnn": "fedavgm.models.cnn",
+        "fedcompass_cifar10_resnet18": "fedavgm.models.fedcompass_cifar10_resnet18",
+        "fedcompass_mnist_cnn": "fedavgm.models.fedcompass_mnist_cnn",
         "tf_example": "fedavgm.models.tf_example",
         "resnet18": "fedavgm.models.resnet18_keras",
         "resnet34": "fedavgm.models.resnet34_keras",
@@ -432,6 +452,8 @@ def main() -> None:
         val_size=val_size,
         use_sparse_labels=use_sparse_labels,
         measurement_session=runtime_measurement,
+        local_steps_override=args.local_steps,
+        step_seed=args.step_seed,
     )
     print(f"--- Client {args.cid}: FlowerClient initialized successfully.")
 
@@ -459,12 +481,14 @@ def main() -> None:
                 measurement.check_resources()
             _, _, metrics = client.fit(
                 params,
-                {"local_epochs": epochs, "batch_size": batch_size},
+                {"local_epochs": epochs, "batch_size": batch_size,
+                 **({"local_steps": args.local_steps, "step_seed": resolve_seed(args.step_seed),
+                     "server_round": r} if args.local_steps is not None else {})},
             )
             params = client.get_parameters({})
             train_time = metrics.get("train_time")
             if measurement:
-                measurement.record(r, train_time, epochs=epochs, batch_size=batch_size,
+                measurement.record(r, train_time, epochs=epochs if args.local_steps is None else None, batch_size=batch_size,
                                    seed=args.local_seed,
                                    metrics=metrics, timing_definition=metrics.get("timing_definition", "unknown"),
                                    num_examples=train_size if train_size is not None else len(x_train))

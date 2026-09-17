@@ -93,9 +93,14 @@ class FlowerClient(fl.client.NumPyClient):
         val_size: Optional[int] = None,
         use_sparse_labels: Optional[bool] = None,
         measurement_session=None,
+        local_steps_override: Optional[int] = None,
+        step_seed: Optional[int] = None,
     ) -> None:
         # Instantiate model first, then detect loss type (sparse vs categorical)
         self.model = instantiate(model_cfg)
+        self._reset_optimizer_each_round = bool(
+            getattr(self.model, "_reset_optimizer_each_round", False)
+        )
 
         def _uses_sparse_categorical_loss(loss_obj) -> bool:
             try:
@@ -127,6 +132,8 @@ class FlowerClient(fl.client.NumPyClient):
         self.cid = str(cid) if cid is not None else None
         self._measurement_session = measurement_session
         self._measurement_round = 0
+        self._local_steps_override = local_steps_override
+        self._step_seed = step_seed
         self.enable_compression = enable_compression
         self._quantizer = (
             ErrorFeedbackQuantizer(num_bits=quantization_bits, error_feedback=error_feedback)
@@ -192,6 +199,15 @@ class FlowerClient(fl.client.NumPyClient):
         decode_time = time.time() - decode_start if was_quantized else 0.0
 
         self.model.set_weights(received_parameters)
+        if getattr(self, "_reset_optimizer_each_round", False):
+            optimizer = tf.keras.optimizers.deserialize(
+                tf.keras.optimizers.serialize(self.model.optimizer)
+            )
+            self.model.compile(
+                optimizer=optimizer,
+                loss=self.model.loss,
+                metrics=["accuracy"],
+            )
 
         server_send_time = config.get("server_send_time", None)
         server_wait_time = config.get("server_wait_time", None)
@@ -216,16 +232,31 @@ class FlowerClient(fl.client.NumPyClient):
             if self._batch_size_override is not None
             else config.get("batch_size")
         )
+        from fixed_step_training import fit_fixed_steps, resolve_seed, resolve_steps
+
+        steps = resolve_steps(getattr(self, "_local_steps_override", None), config.get("local_steps"))
+        if config.get("training_mode") == "steps" and steps is None:
+            raise ValueError("Step training requested without local_steps")
+        if steps is not None and self._use_dataset:
+            raise ValueError("Fixed-step mode currently requires array-backed training data")
+        step_metrics = {}
 
         logging.info(
-            "[Client] Starting local training: epochs=%s batch_size=%s",
+            "[Client] Starting local training: epochs=%s batch_size=%s local_steps=%s",
             epochs,
             batch_size,
+            steps,
         )
 
         # Keep resource probing and logging outside the measured training interval.
         train_start = time.perf_counter()
-        if self._use_dataset:
+        if steps is not None:
+            seed = resolve_seed(getattr(self, "_step_seed", None), config.get("step_seed"))
+            train_duration, step_metrics = fit_fixed_steps(
+                self.model, self.x_train, self.y_train, steps, batch_size, seed,
+                self.cid, int(config.get("server_round", self._measurement_round)))
+            num_train_examples = len(self.x_train)
+        elif self._use_dataset:
             train_ds = self._train_dataset_fn(batch_size, training=True) if self._train_dataset_fn else None
             val_ds = self._val_dataset_fn(batch_size, training=False) if self._val_dataset_fn else None
             self.model.fit(
@@ -245,7 +276,8 @@ class FlowerClient(fl.client.NumPyClient):
             )
             num_train_examples = len(self.x_train)
         train_end = time.perf_counter()
-        train_duration = train_end - train_start
+        if steps is None:
+            train_duration = train_end - train_start
         cpu_freq_end = _read_cpu_freq_mhz()
         cpu_usage_end = resource.getrusage(resource.RUSAGE_SELF)
         cpu_time_end = float(cpu_usage_end.ru_utime + cpu_usage_end.ru_stime)
@@ -253,11 +285,12 @@ class FlowerClient(fl.client.NumPyClient):
         logging.info("[Client] Training finished in %.2f seconds", train_duration)
 
         metrics = {
-            "local_epochs_used": float(epochs) if epochs is not None else None,
+            "local_epochs_used": float(epochs) if epochs is not None and steps is None else None,
             "batch_size_used": float(batch_size) if batch_size is not None else None,
             "partition_id": self.cid,
             "training_run_id": config.get("training_run_id"),
             "timing_definition": "model_fit_v2",
+            **step_metrics,
         }
         if isinstance(server_to_client_ms, (int, float)):
             metrics["server_to_client_ms"] = float(server_to_client_ms)
@@ -301,9 +334,9 @@ class FlowerClient(fl.client.NumPyClient):
                     audit[destination] = max(0, resource_after[source] - resource_before[source]) / divisor
             # This interval spans fit processing, not just model.fit, to expose protocol CPU cost.
             monitor.record(int(config.get("server_round", self._measurement_round)), train_duration,
-                           num_examples=num_train_examples, epochs=epochs, batch_size=batch_size,
+                           num_examples=num_train_examples, epochs=epochs if steps is None else None, batch_size=batch_size,
                            metrics={**metrics, **audit}, resource_before=resource_before,
-                           resource_after=resource_after, timing_definition="model_fit_v2")
+                           resource_after=resource_after, timing_definition=metrics["timing_definition"])
             metrics.update(audit)
 
         weights = [w.astype("float32", copy=True) for w in self.model.get_weights()]

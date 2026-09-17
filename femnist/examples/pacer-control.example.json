@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "run_id": "pacer-example",
+  "config_version": 1,
+  "effective_round": 1,
+  "theta_target_s": 4.5,
+  "deadline_s": 4.8,
+  "ref_a": 0.02,
+  "q": 0.9,
+  "q_lower": 0.85,
+  "q_upper": 0.95,
+  "required_client_ids": ["0", "1", "2"],
+  "timing_basis": "local_train_wall_s",
+  "gamma_window": 50,
+  "gamma_min_samples": 20,
+  "violation_patience": 3,
+  "feedback_max_age_rounds": 2
+}

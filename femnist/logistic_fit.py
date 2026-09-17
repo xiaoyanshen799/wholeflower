@@ -2,12 +2,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from scipy.optimize import curve_fit
+from scipy.optimize import brentq, curve_fit
 
 # ----------- 读取 CSV 文件 -----------
 
 # CSV 文件路径
-csv_file = "/home/xiaoyan/wholeflower/flowertune-llm-medical/.flower-process-runtime/20260326_002840/logs/output.csv"
+csv_file = "/home/xiaoyan/wholeflower/femnist/logs/mnistdata/pacer_mnist20_run01/server.csv"
 EXCLUDED_CLIENT = "ipv4:10.0.0.4:40254"
 # 读取 CSV 文件
 df = pd.read_csv(csv_file)
@@ -20,15 +20,16 @@ client_colors = {}
 empirical_cdfs = {}
 
 MAX_DURATION = 1000.0
+TARGET_CDF = 0.9
 
 
 # 从 CSV 中提取客户端时长信息
 for _, row in df.iterrows():
-    client_id = str(row["num_examples"])  # 客户端ID
+    client_id = str(row["partition_id"])  # 客户端ID
     # round_time = row["server_to_client_time"] + row["client_to_server_time"]    # 任务完成时长
     #round_time = row["computing_time"]  
-    #round_time = row["client_train_s"]  # 任务完成时长
-    round_time = row["duration"]  # 任务完成时长
+    round_time = row["client_train_s"]  # 任务完成时长
+    # round_time = row["duration"]  # 任务完成时长
     client_durations[client_id].append({"duration": round_time})  # 存储时长
     if client_id not in client_num_examples:
         client_num_examples[client_id] = row["num_examples"]
@@ -40,6 +41,45 @@ from scipy.interpolate import PchipInterpolator
 def logistic_cdf(t, theta, k):
     """2 参数 Logistic 的 CDF."""
     return 1.0 / (1.0 + np.exp(-(t - theta)/k))
+
+def product_logistic_cdf(t, params):
+    """所有 client 都完成的 CDF: product_i F_i(t)."""
+    value = 1.0
+    for theta_hat, k_hat in params.values():
+        value *= logistic_cdf(t, theta_hat, k_hat)
+    return float(value)
+
+def product_logistic_quantile(params, target, t_min, t_max):
+    """求 product CDF 达到 target 的时间."""
+    if not params or not np.isfinite(t_min) or not np.isfinite(t_max):
+        return np.nan
+
+    def objective(t):
+        return product_logistic_cdf(t, params) - target
+
+    lo = float(t_min)
+    hi = float(t_max)
+    if objective(lo) >= 0:
+        return lo
+
+    # Logistic tail may need a little extrapolation beyond observed max.
+    span = max(hi - lo, 1.0)
+    for _ in range(80):
+        if objective(hi) >= 0:
+            return float(brentq(objective, lo, hi))
+        hi += span
+        span *= 1.5
+    return np.nan
+
+def empirical_cdf_quantile(values, target):
+    """经验 CDF 的反函数: 返回第一个使 CDF >= target 的观测值."""
+    arr = np.asarray(values, dtype=float)
+    arr = np.sort(arr[np.isfinite(arr)])
+    if arr.size == 0:
+        return np.nan
+    idx = int(np.ceil(target * arr.size)) - 1
+    idx = min(max(idx, 0), arr.size - 1)
+    return float(arr[idx])
 
 def weibull_cdf(t, c, lam):
     return 1 - np.exp(- (t/lam)**c)
@@ -351,12 +391,20 @@ else:
     t_grid = np.array([])
     prod_fixed = np.array([])
 
+product_cdf_q90 = product_logistic_quantile(
+    client_params,
+    TARGET_CDF,
+    min(all_durations) if all_durations else np.nan,
+    max(all_durations) if all_durations else np.nan,
+)
+
 # df["_duration"] = df["client_train_s"] + df["client_to_server_ms"] / 1000.0 + df["server_to_client_ms"] / 1000.0
 
-df["_duration"] = df["duration"]
+df["_duration"] = df["client_train_s"]
 # 尝试自动识别“轮次”的列名
 _round_candidates = ["round", "server_round", "round_idx", "global_round", "comm_round", "epoch", "iteration"]
 _round_col = next((c for c in _round_candidates if c in df.columns), None)
+per_round_cdf_q90 = np.nan
 
 if _round_col is not None:
     # 每轮内先过滤掉 >35s 的，再取最大
@@ -370,6 +418,7 @@ if _round_col is not None:
     print("max per-round time (≤430s):", per_round_time)
 
     if len(per_round_time) > 0:
+        per_round_cdf_q90 = empirical_cdf_quantile(per_round_time, TARGET_CDF)
         # 画经验CDF
         per_round_time_sorted = np.sort(per_round_time)
         per_round_cdf = np.arange(1, len(per_round_time_sorted) + 1) / float(len(per_round_time_sorted))
@@ -381,6 +430,8 @@ if _round_col is not None:
         #     label="Actual per-round max (≤35s)"
         # )
 
+print(f"[CDF {TARGET_CDF:.1f}] product logistic CDF quantile = {product_cdf_q90:.6f} s")
+print(f"[CDF {TARGET_CDF:.1f}] actual per-round max CDF quantile = {per_round_cdf_q90:.6f} s")
 
 plt.xlabel("Time (s)")
 plt.ylabel("Cumulative Probability")
@@ -390,5 +441,5 @@ plt.grid(alpha=0.3)
 plt.ylim(0, 1.1)
 # plt.xlim(left=25, right=35)
 plt.tight_layout()
-plt.savefig("server_20251022_171102.png")
+plt.savefig("atest.png")
 plt.show()

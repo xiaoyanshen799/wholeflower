@@ -3,6 +3,7 @@ from datetime import datetime
 import logging
 import os
 import threading
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -25,6 +26,8 @@ from fedavgm.dataset import (
 )
 from fedavgm.models import (
     cnn,
+    fedcompass_cifar10_resnet18,
+    fedcompass_mnist_cnn,
     model_to_parameters,
     mobilenet_v2_075,
     mobilenet_v2_100,
@@ -172,6 +175,8 @@ def main() -> None:
         default="resnet20",
         choices=[
             "cnn",
+            "fedcompass_cifar10_resnet18",
+            "fedcompass_mnist_cnn",
             "tf_example",
             "resnet18",
             "resnet34",
@@ -190,6 +195,8 @@ def main() -> None:
     )
     parser.add_argument("--server-momentum", type=float, default=0.9, help="Server momentum (FedAvgM)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Client local epochs")
+    parser.add_argument("--local-steps", type=int, help="Fixed optimizer updates per client per round")
+    parser.add_argument("--step-seed", type=int, default=42, help="Fixed-step data sampling seed")
     parser.add_argument("--batch-size", type=int, default=32, help="Client batch size")
     parser.add_argument("--client-lr", type=float, default=0.01, help="Client learning rate (to build initial model)")
     parser.add_argument("--address", default="0.0.0.0:8081", help="Server bind address, e.g. 0.0.0.0:8081")
@@ -306,7 +313,35 @@ def main() -> None:
         help="TiFL: Credits per tier (Algorithm 2); omit for unlimited.",
     )
 
+    parser.add_argument("--pacer-config", type=Path, help="External FedPacer control JSON; enables fixed-roster monitoring")
+    parser.add_argument("--pacer-log", type=Path, default=Path("logs/pacer_rounds.jsonl"))
+
     args = parser.parse_args()
+    from fixed_step_training import SUPPORTED_DATASETS, positive_steps, resolve_seed, with_fixed_steps
+    try:
+        if args.local_steps is not None:
+            positive_steps(args.local_steps)
+            if args.dataset not in SUPPORTED_DATASETS:
+                raise ValueError("Fixed-step mode currently requires array-backed training data")
+        resolve_seed(args.step_seed)
+    except ValueError as error:
+        parser.error(str(error))
+    pacer_source = None
+    if args.pacer_config is not None:
+        from pacer.external import FileControlSource, JsonlSink
+
+        if args.strategy in {"fedcs", "tifl"} or args.reporting_fraction != 1.0:
+            parser.error("Pacer requires FedAvg/FedAvgM and --reporting-fraction 1.0")
+        if fl.__version__ != "1.5.0":
+            parser.error("This Pacer integration targets Flower 1.5.0; use the project venv")
+        pacer_sink = JsonlSink(args.pacer_log)
+        try:
+            pacer_source = FileControlSource(args.pacer_config, pacer_sink)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        if args.clients != len(pacer_source.current.required_client_ids):
+            parser.error("--clients must equal the size of required_client_ids in the Pacer config")
+        logging.info("[Pacer] python=%s flwr=%s", sys.executable, fl.__file__)
 
     profile_url = None
     if args.profile_http_port and args.profile_http_port > 0:
@@ -386,6 +421,8 @@ def main() -> None:
     logging.getLogger().addHandler(file_handler)
     model_builders = {
         "cnn": cnn,
+        "fedcompass_cifar10_resnet18": fedcompass_cifar10_resnet18,
+        "fedcompass_mnist_cnn": fedcompass_mnist_cnn,
         "tf_example": tf_example,
         "resnet18": resnet18_keras,
         "resnet34": resnet34_keras,
@@ -452,6 +489,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     cfg = OmegaConf.create({"local_epochs": args.local_epochs, "batch_size": args.batch_size})
     fit_config_fn = get_on_fit_config(cfg)
+    if args.local_steps is not None:
+        fit_config_fn = with_fixed_steps(fit_config_fn, args.local_steps, args.step_seed)
+        logging.info("Fixed-step workload: local_steps=%s step_seed=%s (epoch settings inactive)",
+                     args.local_steps, args.step_seed)
     sample_size = args.eval_sample_size if args.eval_sample_size > 0 else None
     evaluate_fn = get_evaluate_fn(
         model,
@@ -549,6 +590,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Start Flower server
     # ------------------------------------------------------------------
+    if pacer_source is not None:
+        from pacer.server import PacerStrategy
+
+        strategy.min_fit_clients = args.clients
+        strategy.min_available_clients = args.clients
+        strategy.accept_failures = False
+        strategy = PacerStrategy(strategy, pacer_source, pacer_sink)
+
     print(f">>> Starting Flower server on {args.address} with strategy {strategy}…")
     fl.server.start_server(
         server_address=args.address,

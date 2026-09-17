@@ -15,8 +15,11 @@ dist/
 *.egg-info/
 
 # Data and Logs
-data_partitions1/
+data_partitions/
 data_partitions_new/
+data_partitions_mnist/
+data_partitions_cifar10_class20/
+data_partitions_speech_commands/
 data_for_s3/
 logs/
 *.log

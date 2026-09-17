@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Managed profiling keeps its own units, logs, barrier and failure handling.
+if [[ -n "${WARMUP_JOB:-}" ]]; then
+  WARMUP_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  exec "${WARMUP_PYTHON:-python3}" "$WARMUP_PROJECT_DIR/warmup_launch.py" --job "$WARMUP_JOB"
+fi
+
 # 使用方式：
 #   PY=/path/to/python ./launch_clients.sh [DATA_DIR] [SERVER_ADDR] [MAX_CLIENTS]
 #
@@ -14,10 +20,26 @@ DATASET=${DATASET:-speech_commands}
 MODEL=${MODEL:-resnet34}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-0.001}
+LOCAL_EPOCHS=${LOCAL_EPOCHS:-}
+LOCAL_STEPS=${LOCAL_STEPS:-}
+STEP_SEED=${STEP_SEED:-}
+NUM_CLASSES=${NUM_CLASSES:-10}
+CPU_ONLY=${CPU_ONLY:-0}
 MPS_ENABLE=${MPS_ENABLE:-1}
+if [[ "$CPU_ONLY" == "1" ]]; then
+  MPS_ENABLE=0
+fi
 MPS_PERCENT=${MPS_PERCENT:-5}
 MPS_PIPE_DIRECTORY=${MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}
 MPS_LOG_DIRECTORY=${MPS_LOG_DIRECTORY:-/tmp/nvidia-mps}
+BIND_CLIENT_TO_CPU=${BIND_CLIENT_TO_CPU:-0}
+ENABLE_CPU_AFFINITY=${ENABLE_CPU_AFFINITY:-$BIND_CLIENT_TO_CPU}
+CPU_AFFINITY_OFFSET=${CPU_AFFINITY_OFFSET:-0}
+CPU_AFFINITY_WRAP=${CPU_AFFINITY_WRAP:-1}
+MEASUREMENT_RUN_ID=${MEASUREMENT_RUN_ID:-}
+PACER_ENABLE=${PACER_ENABLE:-0}
+PACER_LOG_DIR=${PACER_LOG_DIR:-}
+PACER_RESOURCE_STATE_DIR=${PACER_RESOURCE_STATE_DIR:-}
 
 PY=${PY:-python3}
 # Accept common wrappers like "( python3 )" and optional args like "python3 -u".
@@ -41,9 +63,22 @@ SYSTEMD_MODE="system"
 
 # femnist 项目目录（脚本所在目录），避免从别的路径执行导致 working-directory/data-dir 错乱
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$PROJECT_DIR/logs"
+if [[ -n "${CLIENT_LOG_DIR:-}" ]]; then
+  mkdir -p -- "$CLIENT_LOG_DIR"
+  CLIENT_LOG_DIR=$(readlink -f "$CLIENT_LOG_DIR")
+else
+  CLIENT_LOG_DIR=$(mktemp -d "$PROJECT_DIR/logs/clients_$(date +%Y%m%d_%H%M%S)_XXXXXX")
+fi
+printf 'client_id,cpu,cpu_affinity\n' > "$CLIENT_LOG_DIR/cpu_config.csv"
 
 # Optional: CSV mapping client_id -> new_cpu (fraction 0-1). If set, use per-client CPUQuota.
 CPU_MAP_CSV=${CPU_MAP_CSV:-"$PROJECT_DIR/../logs/client_num_examples.csv"}
+CPU_MAP_ONLY=${CPU_MAP_ONLY:-0}
+if [[ "$CPU_MAP_ONLY" == "1" && ! -f "$CPU_MAP_CSV" ]]; then
+  echo "ERROR: CPU_MAP_ONLY=1 requires an existing CPU_MAP_CSV"
+  exit 1
+fi
 
 # 把 data_dir 变成绝对路径，避免工作目录不同导致找不到
 if [[ "$DATA_DIR" = /* ]]; then
@@ -63,6 +98,9 @@ ENV_VARS=(
   --setenv=CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE_DIRECTORY"
   --setenv=CUDA_MPS_LOG_DIRECTORY="$MPS_LOG_DIRECTORY"
 )
+if [[ "$CPU_ONLY" == "1" ]]; then
+  ENV_VARS+=(--setenv=CUDA_VISIBLE_DEVICES= --setenv=SKIP_TF_GPU_MEMORY_GROWTH=1)
+fi
 
 echo "Data dir    : $DATA_DIR_ABS"
 echo "Server      : $SERVER"
@@ -71,7 +109,11 @@ echo "Python      : ${PY_CMD[*]}"
 echo "Run as user : $RUN_AS_USER"
 echo "Project dir : $PROJECT_DIR"
 echo "CPU map CSV : $CPU_MAP_CSV"
-echo "CPU affinity: disabled"
+echo "Run logs    : $CLIENT_LOG_DIR"
+echo "CPU affinity: $ENABLE_CPU_AFFINITY"
+echo "Bind cid CPU: $BIND_CLIENT_TO_CPU (offset=$CPU_AFFINITY_OFFSET wrap=$CPU_AFFINITY_WRAP)"
+echo "Measure id  : ${MEASUREMENT_RUN_ID:-auto}"
+echo "Pacer       : $PACER_ENABLE"
 echo "LR          : $LR"
 echo "MPS enable  : $MPS_ENABLE"
 echo "MPS percent : $MPS_PERCENT"
@@ -166,23 +208,33 @@ ensure_mps_daemon
 count=0
 launch_pids=()
 declare -A CLIENT_CPU
+declare -A CLIENT_AFFINITY
 if [[ -f "$CPU_MAP_CSV" ]]; then
-  while IFS=, read -r cid _ _ new_cpu; do
-    [[ "$cid" == "client_id" || -z "$cid" ]] && continue
-    cid=$(echo "$cid" | tr -d ' \t\r')
-    new_cpu=$(echo "$new_cpu" | tr -d ' \t\r')
+  cpu_map_args=(--cpu-map "$CPU_MAP_CSV")
+  if [[ "$CPU_MAP_ONLY" == "1" && "$ENABLE_CPU_AFFINITY" == "1" ]]; then
+    cpu_map_args+=(--require-distinct-affinity)
+  fi
+  cpu_rows=$("${PY_CMD[@]}" "$PROJECT_DIR/warmup_launch.py" "${cpu_map_args[@]}")
+  while IFS=$'\t' read -r cid new_cpu affinity; do
+    [[ -z "$cid" ]] && continue
     CLIENT_CPU["$cid"]="$new_cpu"
-  done < "$CPU_MAP_CSV"
+    if [[ "$ENABLE_CPU_AFFINITY" == "1" ]]; then
+      CLIENT_AFFINITY["$cid"]="$affinity"
+    fi
+  done <<< "$cpu_rows"
 fi
 for f in "$DATA_DIR_ABS"/client_*.npz; do
   base=$(basename "$f")        # client_00035.npz
   cid=${base#client_}          # 00035.npz
   cid=${cid%.npz}              # 00035
   cid=$((10#$cid))             # 去掉前导 0，转成整数
+  if [[ "$CPU_MAP_ONLY" == "1" && -z "${CLIENT_CPU[$cid]+set}" ]]; then
+    continue
+  fi
 
   unit="fl_client_${cid}"
   unit_name="${unit}.scope"
-  log_file="$DATA_DIR_ABS/${base%.npz}.log"
+  log_file="$CLIENT_LOG_DIR/process_${cid}.log"
 
   echo "Starting client for $base (cid=$cid)"
   echo "  unit : $unit_name"
@@ -198,9 +250,52 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
     --dataset "$DATASET"
     --model "$MODEL"
     --lr "$LR"
+    --num-classes "$NUM_CLASSES"
     --batch-size "$BATCH_SIZE"
     --uplink-num-bits 0
+    --log-file "$CLIENT_LOG_DIR/training_${cid}.log"
+    --training-timing-jsonl "$CLIENT_LOG_DIR/client_${cid}.jsonl"
+    --measurement-run-id "${MEASUREMENT_RUN_ID:-$(basename "$CLIENT_LOG_DIR")}"
+    --cpu-fraction "${CLIENT_CPU[$cid]:-1.00}"
   )
+  if [[ -n "$LOCAL_EPOCHS" ]]; then
+    client_cmd+=(--epochs "$LOCAL_EPOCHS")
+  fi
+  if [[ -n "$LOCAL_STEPS" ]]; then
+    client_cmd+=(--local-steps "$LOCAL_STEPS")
+  fi
+  if [[ -n "$STEP_SEED" ]]; then
+    client_cmd+=(--step-seed "$STEP_SEED")
+  fi
+  if [[ "$PACER_ENABLE" == "1" ]]; then
+    client_cmd+=(--pacer)
+    if [[ -n "$PACER_LOG_DIR" ]]; then
+      mkdir -p "$PACER_LOG_DIR"
+      client_cmd+=(--pacer-log "$PACER_LOG_DIR/pacer_client_${cid}.jsonl")
+    fi
+    if [[ -n "$PACER_RESOURCE_STATE_DIR" ]]; then
+      client_cmd+=(--pacer-resource-state "$PACER_RESOURCE_STATE_DIR/client_${cid}.json")
+    fi
+  fi
+  affinity="-"
+  if [[ "$ENABLE_CPU_AFFINITY" == "1" ]]; then
+    affinity="${CLIENT_AFFINITY[$cid]:--}"
+    if [[ "$affinity" == "-" && "$BIND_CLIENT_TO_CPU" == "1" ]]; then
+      cpu_count=$(nproc)
+      affinity=$((cid + CPU_AFFINITY_OFFSET))
+      if [[ "$CPU_AFFINITY_WRAP" == "1" ]]; then
+        affinity=$((affinity % cpu_count))
+      elif (( affinity < 0 || affinity >= cpu_count )); then
+        echo "ERROR: client $cid maps to CPU $affinity, but available CPUs are 0-$((cpu_count - 1))"
+        exit 1
+      fi
+    fi
+  fi
+  if [[ "$affinity" != "-" ]]; then
+    client_cmd+=(--cpu-affinity "$affinity")
+    client_cmd=(taskset -c "$affinity" "${client_cmd[@]}")
+  fi
+  printf '%s,%s,"%s"\n' "$cid" "${CLIENT_CPU[$cid]:-1.00}" "$affinity" >> "$CLIENT_LOG_DIR/cpu_config.csv"
 
   cmd_str="$(printf '%q ' "${client_cmd[@]}")"
   log_q="$(printf '%q' "$log_file")"
@@ -208,7 +303,7 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   cpu_frac="${CLIENT_CPU[$cid]:-1.00}"
   cpu_quota=$(awk -v c="$cpu_frac" 'BEGIN{gsub(/[ \t\r]/,"",c); if(c=="") c=1.00; printf "%.2f%%", c*100}')
   "${SYSTEMD_RUN[@]}" \
-    -p CPUAccounting=yes -p CPUQuota="100%" -p CPUQuotaPeriodSec=20ms \
+    -p CPUAccounting=yes -p CPUQuota="$cpu_quota" -p CPUQuotaPeriodSec=20ms \
     --uid="$RUN_AS_USER" \
     --working-directory="$PROJECT_DIR" \
     "${ENV_VARS[@]}" \
@@ -230,8 +325,9 @@ for f in "$DATA_DIR_ABS"/client_*.npz; do
   fi
 done
 
+launch_failed=0
 for pid in "${launch_pids[@]}"; do
-  wait "$pid" || true
+  wait "$pid" || launch_failed=1
 done
 
 if [[ $count -eq 0 ]]; then
@@ -239,3 +335,4 @@ if [[ $count -eq 0 ]]; then
 else
   echo "Launched $count clients."
 fi
+exit "$launch_failed"
